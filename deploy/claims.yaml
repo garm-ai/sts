@@ -1,0 +1,27 @@
+# The claims policy: definitions and rules only. OpenFGA (deploy/tuples.yaml
+# in the static build, or the live store) holds who is actually a member of
+# which segment — that assignment cannot live here; there are potentially
+# millions of customers. See spec §2.1.
+
+# A role is a bundle of claims. Same meaning as devkit's roles: block.
+# Clearance is written in the bare spelling (INTERNAL, not CLEARANCE_INTERNAL)
+# — garmd accepts both, and the bare form is what a human writes here.
+roles:
+  support-desk:  { clearance: INTERNAL,     compartments: [support],                verbs: [READ] }
+  payments-desk: { clearance: RESTRICTED,   compartments: [financial],              verbs: [READ, WRITE] }
+  self-service:  { clearance: CONFIDENTIAL, compartments: [pii-contact, financial], verbs: [READ],
+                   tool_sets: [self-service] }
+
+# Which segment grants which roles. Membership itself comes from OpenFGA.
+# A principal holding roles from more than one segment gets the UNION: the
+# highest clearance among them, and the union of compartments and verbs.
+segments:
+  retail-vip:    { kind: customer, roles: [self-service] }
+  sme-basic:     { kind: customer, roles: [self-service] }
+  support-staff: { kind: employee, roles: [support-desk] }
+
+# An agent's own authority. The fold turns it into a ceiling automatically —
+# delegation intersects, but that narrowing happens in the verifying daemon,
+# never here.
+agents:
+  order-assistant: { roles: [support-desk] }
