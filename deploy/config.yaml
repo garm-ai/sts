@@ -1,62 +1,73 @@
-# STS configuration. $VARS are expanded from the environment at load.
-# Signing seeds NEVER live in this file — only the names of env vars holding them.
+# STS configuration.
+#
+# Signing keys are named by ENVIRONMENT VARIABLE, never inlined: keys.keys[].pem
+# below is a reference to an env var ($NAME or ${NAME}) holding the PEM-encoded
+# private key, not the key itself. LoadConfig refuses inline key material
+# outright — a config file that could carry a private key is a config file
+# that ends up in a bug report, a wiki, or a screenshot. Run deploy/keygen.sh
+# to generate one.
 issuer: https://sts.internal.example.com
-listen: :8443
+audience: garm://garmd # garmd's own identifier; every minted token's `aud`, never the agent
+listen: :8080 # plaintext for local dev; set STS_TLS_CERT/STS_TLS_KEY in production — see cmd/sts/main.go
+tokenEndpointAudience: https://sts.internal.example.com/token # the `aud` a BFF's client_assertion must carry to call POST /token
+
+delegationTTL: 10m
 
 keys:
   active: k1
-  ed25519:
+  keys:
     - kid: k1
-      seedEnv: STS_SIGN_SEED_K1     # base64 of 32 random bytes: head -c32 /dev/urandom | base64
-    # - kid: k0                     # keep the previous key here during rotation
-    #   seedEnv: STS_SIGN_SEED_K0
+      pem: $STS_SIGN_KEY_K1 # ECDSA P-256 private key, PEM-encoded (SEC1 or PKCS#8)
+    # - kid: k0                 # keep the previous key here during rotation — served for
+    #   pem: $STS_SIGN_KEY_K0   # verification, but new tokens always sign with `active`
 
-ttl:
-  delegation: 10m
-  obo: 5m
-
-# Upstream issuers whose tokens we accept as subject_token / actor_token.
+# Upstream issuers whose tokens this service accepts as subject_token. `kind`
+# is how a verified token becomes "customer" or "employee" — per-issuer
+# configuration, never sniffed from the token (see issuer.go's TrustedIssuer).
 issuers:
-  - name: customer                  # e.g. Zitadel — the customer IdP
+  - name: customer # e.g. Zitadel — the customer IdP
     iss: https://auth.example.com
     jwks: https://auth.example.com/oauth/v2/keys
-    audience: [shop-bff]            # the BFF's own access token audience
+    audience: [shop-bff] # the BFF's own access-token audience
+    kind: customer
 
-  - name: employee                  # e.g. Microsoft Entra ID — the workforce IdP
+  - name: employee # e.g. Microsoft Entra ID — the workforce IdP
     iss: https://login.microsoftonline.com/<tenant-id>/v2.0
     jwks: https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys
     audience: [api://internal-app]
+    kind: employee
 
-  - name: runner-k8s                # projected service-account tokens
-    iss: https://kubernetes.default.svc.cluster.local
-    jwks: https://kubernetes.default.svc.cluster.local/openid/v1/jwks
-    audience: [sts]
-
-  - name: runner-spire              # SPIRE JWT-SVIDs (bare-metal edge)
-    iss: https://spire.example.com
-    jwks: https://spire-oidc.example.com/keys
-    audience: [sts]
-
-# BFFs allowed to perform exchange 1, authenticated with private_key_jwt.
-# keys: inline PEM public keys, or paths to PEM files.
+# BFFs allowed to call POST /token, authenticated with private_key_jwt
+# (RFC 7523). These are PUBLIC keys, not secrets, so — unlike signing keys —
+# they may be given as a file path (below) or inlined directly as PEM text.
 clients:
   - id: shop-bff
     keys: [./clients/shop-bff.pub.pem]
-  - id: internal-app
-    keys: [./clients/internal-app.pub.pem]
 
-# Audiences the STS mints for. "obo" targets require an actor_token.
-# An audience starting with "agent:" (see AgentAudPrefix) is a delegation target.
-targets:
-  - audience: nats
-    flow: obo
-    scopeCeiling: [orders:read, orders:write, order_state:read]
+# The claims policy: role, segment and agent definitions. Segment MEMBERSHIP
+# (who actually belongs to retail-vip, say) is not here — it comes from the
+# authorizer below. See deploy/claims.yaml.
+policy: ./deploy/claims.yaml
 
 authz:
-  # non-openfga build: flat tuple file
+  # Flat, file-backed authorizer for development and CI (see
+  # deploy/tuples.yaml) — every relation is looked up as an exact tuple, no
+  # graph is resolved. An OpenFGA-backed Authorizer, selected the same way in
+  # cmd/sts/main.go, is a later task; it is not built yet.
   static: ./deploy/tuples.yaml
-  # openfga build (-tags openfga): live relationship checks
-  openfga:
-    apiUrl: http://openfga:8080
-    storeId: ${OPENFGA_STORE_ID}
-    modelId: ${OPENFGA_MODEL_ID}
+
+# spec §3.5: an ASSERTION this service cannot verify on its own — whether
+# garmd (the daemon that verifies these tokens) actually enforces
+# record-level confinement to a customer's own data yet. That confinement
+# lives entirely in garmd's FGAChecker, which is not built yet; this service
+# has no way to observe whether it runs, only to be told.
+#
+# While it is "absent", every customer-kind mint is capped at
+# unconfinedCeiling regardless of what the claims policy would otherwise
+# grant, so an unconfined garmd cannot be handed more authority than
+# unconfinedCeiling allows. Flip this to "enforced" only once garmd's
+# confinement check is actually deployed in front of the tools this token
+# reaches — flipping it earlier defeats the point of the gate.
+instanceAuthorization:
+  status: absent # "enforced" | "absent" — no default; an operator must say which is true
+  unconfinedCeiling: PUBLIC # read only while status is absent; empty would refuse every customer-kind mint outright

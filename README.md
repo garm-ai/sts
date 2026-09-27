@@ -1,89 +1,238 @@
-# sts — a small RFC 8693 token service backed by OpenFGA
+# sts — an RFC 8693 security token service
 
-A single-binary Go security token service that sits between your BFFs and the
-NATS auth callout. It does the two token exchanges the agent-on-behalf-of flow
-needs, verifies every presented token against its issuer's JWKS, and asks
-OpenFGA the relationship questions — so authorization lives in one place and the
-human IdP (Zitadel for customers, Entra for employees) stays swappable.
+A small Go service implementing exactly **one** RFC 8693 token exchange: a
+backend-for-frontend (BFF) trades a verified customer or employee token for a
+short-lived delegation token naming one agent. That token carries a `garm`
+claim — this service's authority claim, not OAuth `scope` — which the
+verifying daemon (`garmd`) uses to decide what the agent may do.
 
-```
-customer/employee IdP ─┐
-   (verify subject)     │        ┌── gate 1: may this human invoke this agent?
-                        ▼        │
-BFF ──exchange 1──▶  ┌───────┐  ─┤   (OpenFGA)
-                     │  STS  │   └── mints delegation token (sub=human, aud=agent, may_act)
-runner (k8s/SPIRE) ─▶│       │
-   (verify actor)    └───────┘  ─┐  gate 3: may this runner run this agent?
-                        │         │  (OpenFGA)
-                        └─exchange 2─▶ mints OBO token (sub=human, act={agent, act:{runner}})
-                                        │
-                                        ▼  verified against the STS's JWKS
-                                  NATS auth callout ─▶ NATS user JWT
-```
+This is not a general-purpose STS. There is one exchange, one claim shape,
+and one authorization port. What follows describes exactly what exists.
 
-## What each mechanism does (the part that was confusing)
-
-- **SPIRE / k8s** issue *workload* identity. They prove "this is a real runner." They mint nothing about humans or agents.
-- **This STS** *transforms* tokens under policy. It is the only thing that mints delegation and OBO tokens.
-- **OpenFGA** answers "may X do Y." It issues nothing; the STS calls it mid-exchange.
-
-They are a pipeline, not alternatives. The STS trusts SPIRE/k8s and the IdPs only as **JWKS issuers** it verifies incoming tokens against; it is itself the issuer of the tokens it mints.
-
-## The two exchanges
-
-**Exchange 1 — human → agent (delegation).** The BFF (authenticated as itself with `private_key_jwt`) trades the customer/employee token for a delegation token addressed to one agent, carrying only the task's scopes and a `may_act` naming the agent. Gate 1 (`can_invoke`) is checked here. For an employee acting for a customer, pass `requested_subject=customer:…`; the STS checks `handled_by` and sets `sub`=customer, `act`={employee}.
-
-**Exchange 2 — runner + delegation → on-behalf-of.** The runner presents the delegation as `subject_token` and its own k8s/SPIRE token as `actor_token`, audience `nats`. Gate 3 (`can_run`) is checked here. The STS mints the OBO token: `sub` = the human, `act` = `{sub: agent, act: {sub: runner}}`, scope = delegation ∩ request ∩ the target's ceiling.
-
-### Act chain semantics
-
-Tokens carry typed principals (`customer:C`, `agent:order-assistant`, `runner:agent-runner`) in both `sub` and `act`, so the NATS callout reads them directly without per-issuer subject mapping. The `act` chain is authority-then-execution: the agent is the current actor, an employee link (when staff acts for a customer) nests next, and the runner is the deepest link recording where it ran.
+## What this service does
 
 ```
-customer-direct:        sub=customer:C  act={agent, act:{runner}}
-employee-for-customer:  sub=customer:C  act={agent, act:{employee, act:{runner}}}
+customer/employee IdP ──(verify subject_token)──┐
+                                                  ▼
+BFF ──POST /token (client_assertion)────────▶ ┌───────┐
+      grant_type=token-exchange               │  STS  │──▶ mints a delegation token
+      subject_token=<human token>             └───────┘     `aud`=garmd, `garm`={...}, `act`={agent}
+      agent=<agent name>
 ```
 
-## Run it
+1. The BFF authenticates itself to `POST /token` with a `client_assertion`
+   (`private_key_jwt`, RFC 7523) — a short-lived JWT it signs itself,
+   proving it holds a registered private key. The signature and a
+   single-use `jti` are checked by `ClientRegistry` (`clients.go`).
+2. The BFF's `subject_token` (a customer or employee token) is verified
+   against its own issuer's JWKS by `Verifier` (`issuer.go`). Which issuer
+   means "customer" and which means "employee" is per-issuer configuration
+   (`TrustedIssuer.Kind`), never sniffed from the token.
+3. Three yes/no questions are asked of an `Authorizer` (`authz.go`):
+   `CanInvoke` (may this principal reach this agent at all), `HandledBy`
+   (for an employee acting on a named customer's behalf — the line between
+   helping a customer and impersonating one), and `InSegment` (which of the
+   policy's declared segments the principal belongs to).
+4. A claims policy (`claims.go`, loaded from a YAML file — see
+   `deploy/claims.yaml`) turns segment membership into a `GarmClaim`: a
+   clearance, a set of compartments, a set of verbs, and optional tool
+   sets. Definitions and rules live in that file; *membership* (which of
+   potentially millions of customers belongs to which segment) comes from
+   the `Authorizer`, never the policy file.
+5. A signed token is minted by `Keyring` (`keyring.go`) with ES256 over
+   P-256, and its public keys are served as a JWKS at
+   `/.well-known/jwks.json` for `garmd` to verify against.
+
+## The token shape
+
+There is no `scope` claim anywhere in a minted token. `garm` replaces it
+entirely:
+
+```json
+{
+  "iss": "https://sts.internal.example.com",
+  "aud": "garm://garmd",
+  "sub": "customer:C-8123",
+  "tenant": "acme",
+  "garm": { "clearance": "CONFIDENTIAL", "compartments": ["pii-contact"], "verbs": ["READ"], "kind": "USER" },
+  "act": {
+    "sub": "agent:order-assistant",
+    "garm": { "clearance": "INTERNAL", "verbs": ["READ"], "kind": "AGENT" }
+  },
+  "exp": 1780000000,
+  "iat": 1779999400,
+  "jti": "..."
+}
+```
+
+- **`aud` is always garmd's own identifier** — the verifying daemon this
+  service mints tokens for — never the agent. The agent is named at
+  `act.sub` (`agent:<name>`). An earlier design sketch put the agent in
+  `aud` and used a prefix on it to decide whether an audience meant a
+  delegation; that field (`AgentAudPrefix`) does not exist in this
+  implementation and should not be reintroduced — once `aud` unconditionally
+  names garmd, there is nothing left for such a prefix to decide.
+- **`sub`** is a type-prefixed identity (`customer:C-8123`, never a bare
+  ID) — see `authz.go`'s doc comment for why every identity crossing the
+  `Authorizer` interface is prefixed this way.
+- **`act`** is the RFC 8693 §4.1 actor chain. The outermost `act` is
+  whoever is *currently* acting (the agent, if one is named); a nested
+  `act.act` is a *prior* actor. On the employee-for-customer path the chain
+  is `sub`=customer → `act`=agent → `act.act`=employee: the employee
+  obtained the token earlier, the agent is exercising it now.
+- **`garm.clearance`** is one of `PUBLIC`, `INTERNAL`, `CONFIDENTIAL`,
+  `RESTRICTED` (the bare spelling; `garmd` also accepts `CLEARANCE_*`).
+  An agent's own authority is minted at `act.garm` **unnarrowed** — this
+  service does not intersect the agent's claim against the caller's; that
+  narrowing is `garmd`'s job (spec §2.3), not this one's. The one thing
+  this service *does* refuse to mint is a chain whose verb intersection is
+  empty (a token that would be syntactically valid and useless).
+
+## What is NOT built
+
+- **Exchange 2** (runner + delegation → on-behalf-of, e.g. for a NATS
+  callout) does not exist. There is one `POST /token` handler and it
+  implements exchange 1 only.
+- **The runner / agent-runner broker** is not part of this service.
+- **The NATS auth callout integration** is not part of this service.
+- **An OpenFGA-backed `Authorizer`** is not built yet. The only
+  implementation today is `LoadStaticAuthorizer` (`authz_static.go`): a
+  flat YAML file of already-resolved tuples (see `deploy/tuples.yaml`) — it
+  does not resolve any graph, so a segment granting an agent entitlement is
+  not followed transitively; every relation must be written in its
+  already-resolved form. OpenFGA arrives in a later task, wired in through
+  the same `Authorizer` interface, chosen by `cmd/sts/main.go`.
+
+## `instanceAuthorization` — and why it exists
+
+Confining a customer to their own records — "this order belongs to this
+customer, so only this customer's token may read it" — is enforced by
+`garmd`, the daemon that verifies these tokens, not by this service. This
+service has no way to *observe* whether that enforcement is actually
+running in front of the tools a token will reach; it can only be *told*.
+
+`instanceAuthorization` is that assertion (spec §3.5), and `NewServer`
+refuses to start without it:
+
+```yaml
+instanceAuthorization:
+  status: absent            # "enforced" | "absent" — no default; an operator must say
+  unconfinedCeiling: PUBLIC # read only when status is "absent"
+```
+
+- `status: enforced` means garmd's record-level confinement is deployed and
+  running. This service mints whatever the claims policy grants, unchanged.
+- `status: absent` means it is not — record-level confinement does not
+  exist yet in this codebase's current state. While absent, **every
+  customer-kind mint is capped at `unconfinedCeiling`**, regardless of what
+  the claims policy would otherwise grant, so a customer token can never
+  carry more authority than that ceiling names. An empty `unconfinedCeiling`
+  under `absent` refuses every customer-kind mint outright.
+
+Flipping this to `enforced` is an operational claim about a *different*
+system (garmd), not a switch to flip because this service compiles. Get it
+wrong in the optimistic direction and a customer token can read further
+than garmd actually confines it to.
+
+## Configuration
+
+`LoadConfig` (`config.go`) reads one YAML file (see `deploy/config.yaml`
+for a complete, loadable example) and validates it eagerly — every check
+below is a hard failure at startup with a message naming the field, not a
+mysterious failure discovered at the first request:
+
+- `issuer`, `audience`, `tokenEndpointAudience`, `listen`
+- `keys.active` and `keys.keys[]` — at least one signing key; `active` must
+  name one of them. **Signing keys are never inlined.** Each key's `pem`
+  field is a reference to an environment variable (`$NAME` or `${NAME}`)
+  holding the PEM-encoded ECDSA P-256 private key — `LoadConfig` rejects
+  literal key material in this field outright. Retired keys can stay listed
+  (served for verification, never signed with) during rotation.
+- `issuers[]` — at least one trusted upstream issuer, each with a `kind` of
+  `customer` or `employee`.
+- `clients[]` — BFFs allowed to authenticate with `private_key_jwt`. Client
+  keys are *public* keys, not secrets, so they may be a file path or
+  inlined PEM directly.
+- `policy` — path to the claims policy file (`LoadPolicy`, `claims.go`).
+- `authz.static` — path to the static authorizer tuples file
+  (`LoadStaticAuthorizer`, `authz_static.go`).
+- `instanceAuthorization.status` — must be exactly `enforced` or `absent`.
+- `instanceAuthorization.unconfinedCeiling` — if set, must be one of the
+  four clearance names.
+
+`(*Config).Build(ctx, authz)` wires a loaded `Config` into a running
+`*Server`. It takes the `Authorizer` as a parameter rather than building one
+itself: which implementation to use (the static one today) is a decision
+`cmd/sts/main.go` makes, not `Config`'s.
+
+## Running it
 
 ```bash
-go mod tidy
-./deploy/keygen.sh                       # prints a signing seed, writes BFF keys
-export STS_SIGN_SEED_K1=<from keygen>
-go build ./cmd/sts                       # static authorizer (dev)
+go build ./cmd/sts
+
+# Generate an ES256 signing key and a BFF client keypair. Both must be
+# ECDSA (or RSA) — EdDSA is deliberately excluded from every algorithm
+# allowlist this service accepts, in both directions.
+./deploy/keygen.sh
+export STS_SIGN_KEY_K1="$(cat sts-sign-k1.pem)"
+
 ./sts -config deploy/config.yaml
 ```
 
-For production authorization, build with OpenFGA and point it at your store:
-
 ```bash
-go build -tags openfga ./cmd/sts
-export OPENFGA_STORE_ID=… OPENFGA_MODEL_ID=…
-# load deploy/model.fga and deploy/tuples.openfga.yaml with the fga CLI first
+curl -s localhost:8080/.well-known/jwks.json
+# {"keys":[{"use":"sig","kty":"EC","kid":"k1","crv":"P-256","alg":"ES256", ...}]}
 ```
 
-Verify tokens downstream (the NATS callout) against `https://<issuer>/.well-known/jwks.json`.
+`deploy/config.yaml` ships with `listen: :8080` and no TLS configured — it
+is a local/dev config, and the service loudly warns on startup that it is
+serving plaintext. Set `STS_TLS_CERT` and `STS_TLS_KEY` (paths to a
+certificate and key) in production, or terminate TLS in front of it at a
+proxy or mesh sidecar; `cmd/sts/main.go` refuses to pretend plaintext is
+fine, but it does not refuse to run without TLS, since a sidecar is a
+legitimate place to terminate it.
 
-## How it plugs into what you already have
+Shutdown is signal-aware (`SIGINT`/`SIGTERM`) and graceful, with a 5 second
+timeout for in-flight requests to finish.
 
-- **BFF**: terminate the customer/employee IdP session at the BFF; call `POST /token` for exchange 1 with `client_assertion`. The human token never travels past the BFF — only the minted delegation token does.
-- **Runner/broker**: the runner obtains its k8s SA token or SPIRE SVID (audience `sts`) and calls `POST /token` for exchange 2. This service *is* the runner→agent broker: it verifies the workload identity and checks `can_run`.
-- **NATS callout** (the `natsacl` module): add the STS issuer to its trusted issuers, pointing at the STS JWKS. Map the callout's `principal` from `sub` and expose `act.sub` as the `actor` for manifest rules. The agent reaches only its tenant's subjects because tenant flows from the token.
+## Repository layout
 
-## What runs vs. what to wire
+| File | What it is |
+|---|---|
+| `keyring.go` | Signs tokens (ES256), serves the JWKS |
+| `issuer.go` | Verifies upstream tokens against their issuer's JWKS |
+| `claims.go` | The claims policy: roles, segments, agent authority |
+| `authz.go` | The `Authorizer` interface — three yes/no questions |
+| `authz_static.go` | A flat, file-backed `Authorizer` (dev/CI) |
+| `clients.go` | `private_key_jwt` client authentication + replay protection |
+| `exchange.go` | The `POST /token` handler: the whole exchange, in order |
+| `config.go` | Loads and validates `deploy/config.yaml`'s shape, wires a `Server` |
+| `cmd/sts/main.go` | The binary: flags, logging, TLS, graceful shutdown |
+| `deploy/config.yaml` | A complete, loadable example configuration |
+| `deploy/claims.yaml` | An example claims policy |
+| `deploy/tuples.yaml` | An example static-authorizer tuple file |
+| `deploy/keygen.sh` | Generates a signing key and a BFF client keypair |
+| `deploy/model.fga`, `deploy/tuples.openfga.yaml` | Sketches for the OpenFGA authorizer — **not built yet**; not currently loaded by anything |
 
-The core exchange logic (client auth, multi-issuer verification, both gates, scope intersection, act-chain construction, TTL capping) is exercised by `sts/server_test.go` and passes against `golang-jwt`. Two integration edges were written but not compiled here (the sandbox couldn't fetch `gopkg.in`/`golang.org`/the OpenFGA SDK): the `keyfunc/v3` JWKS wiring in `config.go` and the OpenFGA client in `authz_openfga.go`. Run `go mod tidy && go test ./... && go build -tags openfga ./...` and expect only minor SDK-name adjustments (the OpenFGA `client.Check` shape in particular).
+## Security notes
 
-## Security notes — read before production
-
-- **TLS**: set `STS_TLS_CERT`/`STS_TLS_KEY` or terminate TLS at a mesh sidecar. The STS refuses to pretend plaintext is fine.
-- **Client-assertion replay**: the `jti` single-use cache is in-memory. With multiple replicas, back it with a shared store (NATS KV / Redis) or you lose replay protection across instances.
-- **Sender-constraining**: consider DPoP or mTLS-bound tokens so a stolen OBO token can't be replayed from elsewhere. Not implemented here.
-- **`requested_subject`**: only honored after a `handled_by` check. Keep that check strict — it's the line between "employee helps a customer" and "employee impersonates a customer."
-- **Scope ceilings**: the OBO target ceiling is the last backstop. An agent manifest can narrow further at the callout, but the STS should never mint beyond the ceiling.
-- **Fail closed**: any verification error, missing claim, or OpenFGA error denies. The caller always gets an opaque `access_denied`; the reason is in the logs only.
-- **RunnerID / HumanKind**: the defaults map `sub` naively. Set `Options.RunnerID` to parse k8s `kubernetes.io` claims into `runner:<ns>/<sa>`, and `Options.HumanKind` to distinguish employees from customers by issuer or a group claim.
-
-## Entra / Zitadel note
-
-Neither IdP calls OpenFGA during token exchange in a way you'd want to depend on — Entra's only outbound seam is a sign-in claims extension (enrichment, not an enforced gate), and Zitadel's token-exchange + external-authz is feature-flagged and limited. That's the reason this STS exists: the IdPs authenticate humans, and this service owns every exchange and every OpenFGA check. Verify whether your IdP can accept a SPIFFE JWT-SVID as `actor_token` before relying on it; if not, this STS is where that gap is closed.
+- **Client-assertion replay** protection (`ClientRegistry`) is an
+  in-memory, per-process map. With more than one replica of this service
+  behind a load balancer, replay protection is per-replica, not global —
+  the same assertion can be spent once against each replica before any of
+  them has told the others. A shared store would close this gap; none is
+  built here.
+- **Fail closed.** Every verification error, missing claim, or authorizer
+  error denies the exchange. The caller always receives the same opaque
+  `{"error":"access_denied"}`, whatever the reason — the reason is written
+  to the log, never the response, so this endpoint cannot be used as an
+  enumeration oracle.
+- **`requested_subject`** (an employee acting for a named customer) is only
+  honored after `HandledBy` succeeds. Keep that relation accurate; it is
+  the line between an employee helping a customer and one impersonating
+  them.
+- **Algorithm allowlist.** Both upstream token verification and client
+  assertion verification share one allowlist (`permittedAlgorithms`):
+  ES256/384/512, RS256/384/512, PS256/384/512. `none` and any HMAC
+  algorithm are excluded because there would be nothing to check a
+  signature against; EdDSA is excluded to match `garmd`'s own verifier.

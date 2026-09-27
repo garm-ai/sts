@@ -223,6 +223,13 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(s.serveToken)
 }
 
+// Keyring returns the Server's Keyring, so a caller (cmd/sts's main) can
+// mount its JWKS handler alongside Handler() without constructing a second,
+// redundant Keyring from the same configuration.
+func (s *Server) Keyring() *Keyring {
+	return s.keyring
+}
+
 func (s *Server) serveToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)

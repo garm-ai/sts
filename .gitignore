@@ -1,4 +1,6 @@
 .DS_Store
 /sts
 /clients/*.pem
+/clients/*.key
+/sts-sign-*.pem
 .superpowers/
