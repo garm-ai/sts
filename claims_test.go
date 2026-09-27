@@ -3,6 +3,7 @@ package sts_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"testing"
 
@@ -179,6 +180,24 @@ roles:
 segments:
   s1: { kind: robot, roles: [r1] }
 `,
+		"agent with an empty roles list": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+agents:
+  a1: { roles: [] }
+`,
+		"agent with roles omitted entirely": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+agents:
+  a1: {}
+`,
+		"segment with an empty roles list": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+segments:
+  s1: { kind: customer, roles: [] }
+`,
 	}
 
 	for name, yamlContent := range cases {
@@ -212,6 +231,62 @@ func TestAgentClaimKindIsAgent(t *testing.T) {
 	}
 	if userClaim.Kind != "USER" {
 		t.Fatalf("ForSegments kind = %q, want USER", userClaim.Kind)
+	}
+}
+
+// TestGarmClaimSlicesAreSortedNotJustEqualAsSets guards the sort inside
+// unionOf/sortedKeys, a code path distinct from Segments()'s own inline
+// sort. Every other assertion in this file goes through sameSet, which is
+// order-independent by design, so deleting the slices.Sort call inside
+// sortedKeys would pass the rest of this suite in silence. This test
+// declares compartments and verbs out of alphabetical order across two
+// roles and checks exact slice order with reflect.DeepEqual, so it fails
+// the moment that sort is removed.
+func TestGarmClaimSlicesAreSortedNotJustEqualAsSets(t *testing.T) {
+	p := loadPolicy(t, `
+roles:
+  zebra-role: { clearance: PUBLIC, compartments: [zeta, alpha], verbs: [WRITE, READ] }
+  mid-role:   { clearance: PUBLIC, compartments: [mid],         verbs: [DELETE] }
+segments:
+  s1: { kind: customer, roles: [zebra-role, mid-role] }
+`)
+	c, err := p.ForSegments("customer", []string{"s1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCompartments := []string{"alpha", "mid", "zeta"}
+	if !reflect.DeepEqual(c.Compartments, wantCompartments) {
+		t.Fatalf("Compartments = %v, want %v in sorted order — a minted token must be byte-identical for the same inputs", c.Compartments, wantCompartments)
+	}
+	wantVerbs := []string{"DELETE", "READ", "WRITE"}
+	if !reflect.DeepEqual(c.Verbs, wantVerbs) {
+		t.Fatalf("Verbs = %v, want %v in sorted order", c.Verbs, wantVerbs)
+	}
+}
+
+// TestDeployClaimsYAMLExampleLoadsAndStaysInSync loads the worked example
+// committed at deploy/claims.yaml, exactly as the dev IdP's personas file is
+// loaded by its own test "so it cannot rot". A schema change to claims.go
+// (a renamed field, a stricter validation, a changed union rule) that
+// breaks this file, or a hand-edit that drifts the file from its documented
+// shape, fails this test rather than being discovered later.
+func TestDeployClaimsYAMLExampleLoadsAndStaysInSync(t *testing.T) {
+	p, err := sts.LoadPolicy("deploy/claims.yaml")
+	if err != nil {
+		t.Fatalf("deploy/claims.yaml failed to load: %v", err)
+	}
+	if got := p.Segments(); !sameSet(got, []string{"retail-vip", "sme-basic", "support-staff"}) {
+		t.Fatalf("Segments() = %v, want [retail-vip sme-basic support-staff]", got)
+	}
+	c, err := p.ForSegments("customer", []string{"retail-vip"})
+	if err != nil {
+		t.Fatalf("ForSegments(retail-vip): %v", err)
+	}
+	if c.Clearance != "CONFIDENTIAL" {
+		t.Fatalf("retail-vip clearance = %q, want CONFIDENTIAL — deploy/claims.yaml has drifted from its documented self-service role", c.Clearance)
+	}
+	if !sameSet(c.Compartments, []string{"pii-contact", "financial"}) {
+		t.Fatalf("retail-vip compartments = %v, want [pii-contact financial]", c.Compartments)
 	}
 }
 

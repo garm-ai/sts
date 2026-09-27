@@ -2,6 +2,7 @@ package sts
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"slices"
 
@@ -144,6 +145,9 @@ func LoadPolicy(path string) (*Policy, error) {
 		if !validSegmentKinds[sf.Kind] {
 			return nil, fmt.Errorf("claims: segment %q has kind %q, want \"customer\" or \"employee\"", name, sf.Kind)
 		}
+		if len(sf.Roles) == 0 {
+			return nil, fmt.Errorf("claims: segment %q names no roles; it would grant nothing", name)
+		}
 		for _, roleName := range sf.Roles {
 			if _, ok := roles[roleName]; !ok {
 				return nil, fmt.Errorf("claims: segment %q names undeclared role %q", name, roleName)
@@ -154,6 +158,9 @@ func LoadPolicy(path string) (*Policy, error) {
 
 	agents := make(map[string]policyAgent, len(pf.Agents))
 	for name, af := range pf.Agents {
+		if len(af.Roles) == 0 {
+			return nil, fmt.Errorf("claims: agent %q names no roles; it would have no authority to assert", name)
+		}
 		for _, roleName := range af.Roles {
 			if _, ok := roles[roleName]; !ok {
 				return nil, fmt.Errorf("claims: agent %q names undeclared role %q", name, roleName)
@@ -203,6 +210,13 @@ func (p *Policy) ForSegments(kind string, segmentNames []string) (*GarmClaim, er
 			return nil, fmt.Errorf("claims: unknown segment %q", name)
 		}
 		if seg.kind != kind {
+			// Membership comes from a store this service does not own. A
+			// principal asserting a kind that doesn't match a segment it
+			// supposedly belongs to is either a bug in that store or an
+			// attempt to widen authority; dropping it is correct, but it
+			// must not vanish silently, or nobody ever learns it happened.
+			slog.Default().Warn("claims: dropping segment of mismatched kind",
+				"segment", name, "kind_expected", kind, "kind_found", seg.kind)
 			continue
 		}
 		for _, r := range seg.roles {
@@ -229,6 +243,13 @@ func (p *Policy) ForAgent(name string) (*GarmClaim, error) {
 	roleSet := make(map[string]struct{}, len(a.roles))
 	for _, r := range a.roles {
 		roleSet[r] = struct{}{}
+	}
+	if len(roleSet) == 0 {
+		// LoadPolicy already refuses an agent declared with no roles, so
+		// this should be unreachable. It is here anyway, matching
+		// ForSegments's equivalent guard, as a belt-and-braces refusal
+		// against ever minting a claim with an empty, invalid clearance.
+		return nil, fmt.Errorf("claims: agent %q resolves to no roles; there is no authority to mint", name)
 	}
 	claim := p.unionOf(roleSet)
 	claim.Kind = "AGENT"
