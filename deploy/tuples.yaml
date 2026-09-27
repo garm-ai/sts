@@ -8,18 +8,24 @@
 # Exactly three relations, named after Authorizer's three methods. Absence
 # of a tuple here is a denial, never an error: an unlisted principal, agent,
 # employee, customer or segment simply answers false.
+#
+# Identity convention: every principal/agent/employee/customer string below
+# is TYPE-PREFIXED ("customer:C", "employee:jdoe", "agent:order-assistant"),
+# matching the subject forms the minted tokens carry — see the Authorizer
+# doc comment in sts/authz.go. Segment names are the one exception: they are
+# policy labels, not identities, so they stay bare.
 
 # CanInvoke(principal, agent): may this identity reach this agent at all?
 can_invoke:
   - principal: customer:C
-    agent: order-assistant
+    agent: agent:order-assistant
 
 # HandledBy(employee, customer): is this employee the one assigned to this
 # customer? Asked only when an employee acts on a customer's behalf — the
 # line between helping a customer and impersonating one.
 handled_by:
-  - employee: jdoe
-    customer: C
+  - employee: employee:jdoe
+    customer: customer:C
 
 # InSegment(principal, segment): does this principal belong to this
 # segment? Segment names here should match deploy/claims.yaml's `segments:`

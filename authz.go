@@ -12,6 +12,19 @@ import "context"
 // ordinary, expected state, not a fault. Errors are reserved for genuine
 // faults: a malformed policy at load time, or a real backend failure in an
 // implementation that talks to a remote store.
+//
+// Identity convention: every principal, agent, employee and customer string
+// crossing this interface is TYPE-PREFIXED — "customer:C-8123",
+// "employee:jdoe", "agent:order-assistant" — matching the subject forms the
+// minted tokens actually carry. This is load-bearing: every implementation
+// (this package's file-backed one, and the OpenFGA-backed one that follows
+// it) does exact-string comparison with no normalization step, so a caller
+// that builds an unprefixed customer string for one call and a prefixed one
+// for another silently never matches — and the miss reads back as an
+// ordinary, correct-looking denial. Callers MUST derive these identity
+// strings the same way for every Authorizer call. Segment names are the one
+// exception: they are policy labels, not identities — they stay bare and
+// must match the claims policy's declared Segments() names exactly.
 type Authorizer interface {
 	// CanInvoke reports whether principal may reach agent at all.
 	CanInvoke(ctx context.Context, principal, agent string) (bool, error)

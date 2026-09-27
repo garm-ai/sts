@@ -74,13 +74,31 @@ func LoadStaticAuthorizer(path string) (Authorizer, error) {
 		handledBy: make(map[[2]string]bool, len(sf.HandledBy)),
 		inSegment: make(map[[2]string]bool, len(sf.InSegment)),
 	}
-	for _, t := range sf.CanInvoke {
+	for i, t := range sf.CanInvoke {
+		if t.Principal == "" {
+			return nil, fmt.Errorf("sts: static authorizer file %s: can_invoke[%d]: missing principal", path, i)
+		}
+		if t.Agent == "" {
+			return nil, fmt.Errorf("sts: static authorizer file %s: can_invoke[%d]: missing agent", path, i)
+		}
 		a.canInvoke[[2]string{t.Principal, t.Agent}] = true
 	}
-	for _, t := range sf.HandledBy {
+	for i, t := range sf.HandledBy {
+		if t.Employee == "" {
+			return nil, fmt.Errorf("sts: static authorizer file %s: handled_by[%d]: missing employee", path, i)
+		}
+		if t.Customer == "" {
+			return nil, fmt.Errorf("sts: static authorizer file %s: handled_by[%d]: missing customer", path, i)
+		}
 		a.handledBy[[2]string{t.Employee, t.Customer}] = true
 	}
-	for _, t := range sf.InSegment {
+	for i, t := range sf.InSegment {
+		if t.Principal == "" {
+			return nil, fmt.Errorf("sts: static authorizer file %s: in_segment[%d]: missing principal", path, i)
+		}
+		if t.Segment == "" {
+			return nil, fmt.Errorf("sts: static authorizer file %s: in_segment[%d]: missing segment", path, i)
+		}
 		a.inSegment[[2]string{t.Principal, t.Segment}] = true
 	}
 	return a, nil
