@@ -1,7 +1,30 @@
-# Flat tuples for the StaticAuthorizer (dev / CI, non-openfga build).
-# The static checker does NOT resolve the graph, so write the RESOLVED relations
-# (e.g. the customer's entitlement directly, not via segment membership).
-relations:
-  - agent:order-assistant#can_invoke@customer:C        # gate 1
-  - agent:order-assistant#can_run@runner:agent-runner  # gate 3
-  - customer:C#handled_by@employee:jdoe                # employee-for-customer authority
+# Static authorization tuples for LoadStaticAuthorizer (dev / CI; the
+# OpenFGA-backed implementation is a later, build-tagged task). This checker
+# does not resolve any graph — every relation must be written in its
+# already-resolved form, not derived from another one (e.g. a customer's
+# segment membership does not by itself grant that customer's employees
+# `handled_by`; write `handled_by` directly).
+#
+# Exactly three relations, named after Authorizer's three methods. Absence
+# of a tuple here is a denial, never an error: an unlisted principal, agent,
+# employee, customer or segment simply answers false.
+
+# CanInvoke(principal, agent): may this identity reach this agent at all?
+can_invoke:
+  - principal: customer:C
+    agent: order-assistant
+
+# HandledBy(employee, customer): is this employee the one assigned to this
+# customer? Asked only when an employee acts on a customer's behalf — the
+# line between helping a customer and impersonating one.
+handled_by:
+  - employee: jdoe
+    customer: C
+
+# InSegment(principal, segment): does this principal belong to this
+# segment? Segment names here should match deploy/claims.yaml's `segments:`
+# keys — those are the only segments the claims policy knows how to turn
+# into authority.
+in_segment:
+  - principal: customer:C
+    segment: retail-vip
