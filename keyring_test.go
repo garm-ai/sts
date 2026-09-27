@@ -64,16 +64,64 @@ func TestKeyringSignsES256AndVerifiesAgainstItsJWKS(t *testing.T) {
 func TestKeyringServesEveryKeyButSignsOnlyWithTheActiveOne(t *testing.T) {
 	// During rotation the previous key must still be SERVED, so tokens it
 	// signed keep verifying, while new tokens use the active key.
+	k0PEM := testKeyPEM(t)
+	k1PEM := testKeyPEM(t)
+
+	// Sign a token before rotating, while k0 is active.
+	preRotation, err := sts.NewKeyring([]sts.KeyConfig{{KID: "k0", PEM: k0PEM}}, "k0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTok, err := preRotation.Sign(map[string]any{"sub": "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotate: k1 becomes active, k0 stays configured (retired but served).
 	kr, err := sts.NewKeyring([]sts.KeyConfig{
-		{KID: "k0", PEM: testKeyPEM(t)},
-		{KID: "k1", PEM: testKeyPEM(t)},
+		{KID: "k0", PEM: k0PEM},
+		{KID: "k1", PEM: k1PEM},
 	}, "k1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n := len(kr.JWKS().Keys); n != 2 {
+
+	set := kr.JWKS()
+	if n := len(set.Keys); n != 2 {
 		t.Fatalf("JWKS has %d keys, want 2 — the retired key must stay served", n)
 	}
+	gotKIDs := map[string]bool{}
+	for _, k := range set.Keys {
+		gotKIDs[k.KeyID] = true
+	}
+	if !gotKIDs["k0"] || !gotKIDs["k1"] {
+		t.Fatalf("JWKS kids = %v, want both k0 (retired) and k1 (active) — a bug that "+
+			"drops k0 and serves k1 twice would pass a bare length check", gotKIDs)
+	}
+
+	// The property that actually matters: a token signed under k0 before
+	// rotation must still verify against the post-rotation keyring's JWKS.
+	oldSig, err := jose.ParseSigned(oldTok, []jose.SignatureAlgorithm{jose.ES256})
+	if err != nil {
+		t.Fatalf("pre-rotation token must still parse under ES256: %v", err)
+	}
+	if got := oldSig.Signatures[0].Header.KeyID; got != "k0" {
+		t.Fatalf("pre-rotation token kid = %q, want k0", got)
+	}
+	var k0Pub *jose.JSONWebKey
+	for i := range set.Keys {
+		if set.Keys[i].KeyID == "k0" {
+			k0Pub = &set.Keys[i]
+		}
+	}
+	if k0Pub == nil {
+		t.Fatal("k0 not found in post-rotation JWKS")
+	}
+	if _, err := oldSig.Verify(k0Pub.Key); err != nil {
+		t.Fatalf("a token signed by the retired key no longer verifies after rotation: %v", err)
+	}
+
+	// New tokens must be signed with the ACTIVE key, k1.
 	tok, err := kr.Sign(map[string]any{"sub": "x"})
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +142,7 @@ func TestNewKeyringRejectsUnusableConfigurations(t *testing.T) {
 		"active not present": {[]sts.KeyConfig{{KID: "k0", PEM: good}}, "k1"},
 		"no active named":    {[]sts.KeyConfig{{KID: "k0", PEM: good}}, ""},
 		"duplicate kid":      {[]sts.KeyConfig{{KID: "k1", PEM: good}, {KID: "k1", PEM: good}}, "k1"},
-		"empty kid":          {[]sts.KeyConfig{{KID: "", PEM: good}}, ""},
+		"empty kid":          {[]sts.KeyConfig{{KID: "", PEM: good}}, "nonexistent"},
 		"garbage pem":        {[]sts.KeyConfig{{KID: "k1", PEM: []byte("not a key")}}, "k1"},
 	} {
 		if _, err := sts.NewKeyring(tc.keys, tc.active); err == nil {
