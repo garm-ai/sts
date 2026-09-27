@@ -180,14 +180,19 @@ type garmClaimJSON struct {
 	Kind         string   `json:"kind"`
 }
 
-// actClaimJSON is one `act` level. It is never a pointer field on
+// actClaimJSON is one `act` level. The OUTER one is never a pointer field on
 // mintedToken below: Go always marshals a struct value, which makes it
-// impossible for this package to silently omit an `act` level by leaving a
-// pointer nil. Chain depth is fixed at 2 for this task — sub, then exactly
-// one act — so there is exactly one of these per minted token.
+// impossible for this package to silently omit the first `act` level by
+// leaving a pointer nil. A nested Act is a pointer because it is genuinely
+// optional: it is present only on the employee-for-customer-to-an-agent
+// path, where the chain is customer (sub) -> agent (act) -> employee
+// (act.act) — RFC 8693 §4.1: the outermost act is the CURRENT actor, a
+// nested act is a PRIOR one, so the agent (who acts now) sits outside the
+// employee (who acted earlier, to obtain this token).
 type actClaimJSON struct {
 	Subject string        `json:"sub"`
 	Garm    garmClaimJSON `json:"garm"`
+	Act     *actClaimJSON `json:"act,omitempty"`
 }
 
 // mintedToken is the exact shape spec §1.2 mints. There is no `scope` claim
@@ -312,7 +317,15 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 	}
 	callerIdentity := callerKind + ":" + upstream.Subject
 
+	// tenant is REQUIRED, not merely propagated: confinement to a tenant's
+	// own data depends on it flowing from the verified token, so a token
+	// minted with an empty tenant is a confinement failure, not a cosmetic
+	// gap. Refuse rather than mint "".
 	tenant, _ := upstream.Raw["tenant"].(string)
+	if tenant == "" {
+		s.deny(ctx, "subject token carries no tenant claim", "client", clientID)
+		return "", 0, errDenied
+	}
 
 	// Step 4: handled_by, only when requested_subject is present. This is
 	// the line between an employee helping a customer and one impersonating
@@ -394,22 +407,37 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 		return "", 0, errDenied
 	}
 
+	// The employee's OWN claim is resolved whenever delegating, whether or
+	// not an agent is also named. This is the gate the direct path already
+	// enforces via subClaim above (TestExchangeRefusesAPrincipalWithNoRoles)
+	// and the delegating path must enforce identically: an employee in no
+	// segment has no authority to assert, agent or no agent, and skipping
+	// this resolution was a real hole — the customer's full, unnarrowed
+	// authority would otherwise mint for staff with no entitlement of their
+	// own at all.
+	var employeeClaim *GarmClaim
+	if delegating {
+		employeeClaim, err = s.resolveSegmentClaim(ctx, employeeIdentity, "employee")
+		if err != nil {
+			s.deny(ctx, "acting employee resolves to no roles", "employee", employeeIdentity, "err", err)
+			return "", 0, errDenied
+		}
+	}
+
+	// Step 7: claims, for whoever is named at `act`. An agent's authority is
+	// its own declared claim, never narrowed here — narrowing (intersecting
+	// against sub) happens in garmd, not this service (spec §2.3).
 	var actClaim *GarmClaim
 	if mintingForAgent {
-		// Step 7: claims, for the agent — its own declared authority, never
-		// narrowed here. Narrowing (intersecting against sub) happens in
-		// garmd, not this service (spec §2.3).
 		actClaim, err = s.policy.ForAgent(req.agent)
 		if err != nil {
 			s.deny(ctx, "agent resolves to no roles", "agent", req.agent, "err", err)
 			return "", 0, errDenied
 		}
 	} else {
-		actClaim, err = s.resolveSegmentClaim(ctx, employeeIdentity, "employee")
-		if err != nil {
-			s.deny(ctx, "acting employee resolves to no roles", "employee", employeeIdentity, "err", err)
-			return "", 0, errDenied
-		}
+		// delegating with no agent named: the employee themself occupies
+		// `act`, exercising the customer's authority directly.
+		actClaim = employeeClaim
 	}
 
 	// --- refusals (spec §2.4) and the instance-authorization gate (§3.5) --
@@ -440,7 +468,25 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 		}
 	}
 
-	if len(intersectVerbs(subClaim.Verbs, actClaim.Verbs)) == 0 {
+	// chain is every level this exchange is about to mint — 2 levels
+	// ordinarily, 3 when delegating to a named agent (sub, agent, employee).
+	// Both refusals below walk it in full, not a hand-unrolled sub/act pair,
+	// so a third (or later, deeper) level is covered automatically rather
+	// than silently falling outside the check.
+	chain := []*GarmClaim{subClaim, actClaim}
+	if mintingForAgent && delegating {
+		chain = append(chain, employeeClaim)
+	}
+
+	// spec §2.4 refuses an empty VERB intersection over the chain — a token
+	// that would be syntactically valid and useless. It deliberately does
+	// NOT refuse an empty compartment intersection: garmd's CompartmentSet
+	// covers `need &^ held == 0`, so an empty held set means "no
+	// compartments held" (fail-safe) and is never read as "unrestricted",
+	// and a tool may legitimately require none. This fixture's own
+	// happy-path chain folds to zero compartments in common, which is
+	// correct and expected, not a gap.
+	if len(intersectAllVerbs(chain)) == 0 {
 		s.deny(ctx, "verb intersection over the chain is empty", "principal", subIdentity)
 		return "", 0, errDenied
 	}
@@ -449,11 +495,14 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 	// non-empty garm.clearance, or garmd's ParseClaims refuses the whole
 	// token. ForSegments/ForAgent already guarantee this, but a mint-time
 	// assertion here is cheap defense in depth for the one property that
-	// turns a single miss into a total outage.
-	if subClaim.Clearance == "" || actClaim.Clearance == "" {
-		s.deny(ctx, "internal: a resolved claim has an empty clearance",
-			"sub_clearance", subClaim.Clearance, "act_clearance", actClaim.Clearance)
-		return "", 0, errDenied
+	// turns a single miss into a total outage. Walking chain, rather than
+	// naming subClaim/actClaim directly, means this keeps covering every
+	// level even as the chain grows a third one.
+	for _, c := range chain {
+		if c.Clearance == "" {
+			s.deny(ctx, "internal: a resolved claim in the chain has an empty clearance")
+			return "", 0, errDenied
+		}
 	}
 
 	// --- mint --------------------------------------------------------
@@ -472,6 +521,20 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 		actSubject = employeeIdentity
 	}
 
+	act := actClaimJSON{
+		Subject: actSubject,
+		Garm:    toGarmClaimJSON(actClaim),
+	}
+	if mintingForAgent && delegating {
+		// customer (sub) -> agent (act) -> employee (act.act): the agent is
+		// the current actor and sits outermost; the employee, who acted
+		// earlier to obtain this token, nests inside it (RFC 8693 §4.1).
+		act.Act = &actClaimJSON{
+			Subject: employeeIdentity,
+			Garm:    toGarmClaimJSON(employeeClaim),
+		}
+	}
+
 	claims := mintedToken{
 		Issuer:    s.issuer,
 		Audience:  s.audience,
@@ -481,10 +544,7 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 		ID:        jti,
 		Tenant:    tenant,
 		Garm:      toGarmClaimJSON(subClaim),
-		Act: actClaimJSON{
-			Subject: actSubject,
-			Garm:    toGarmClaimJSON(actClaim),
-		},
+		Act:       act,
 	}
 
 	tok, err := s.keyring.Sign(claims)
@@ -542,6 +602,24 @@ func (s *Server) applyInstanceAuthorization(granted string) (effective string, c
 // membership (no map is consulted for the RESULT, only for a lookup — the
 // output order follows a's order, which is itself already sorted by
 // unionOf, so this never becomes a source of nondeterminism).
+// intersectAllVerbs folds intersectVerbs across every claim in chain, in
+// order, short-circuiting to nil the moment the running intersection is
+// empty. Used only to decide the §2.4 refusal — never to narrow what is
+// actually minted (§2.3: this service does not pre-intersect).
+func intersectAllVerbs(chain []*GarmClaim) []string {
+	if len(chain) == 0 {
+		return nil
+	}
+	result := chain[0].Verbs
+	for _, c := range chain[1:] {
+		result = intersectVerbs(result, c.Verbs)
+		if len(result) == 0 {
+			return nil
+		}
+	}
+	return result
+}
+
 func intersectVerbs(a, b []string) []string {
 	inB := make(map[string]struct{}, len(b))
 	for _, v := range b {

@@ -167,10 +167,15 @@ func newFixture(t *testing.T, policyYAML string, authz *fakeAuthz, instance sts.
 // with no capping in the way.
 var enforced = sts.InstanceAuthzConfig{Status: "enforced"}
 
+// defaultTestTenant is what customerToken/employeeToken carry unless a test
+// overrides it via extra — tenant is now a REQUIRED claim (Important 3), so
+// every test that isn't specifically about that requirement needs one.
+const defaultTestTenant = "acme"
+
 func (f *fixture) customerToken(sub string, extra map[string]any) string {
 	f.t.Helper()
 	claims := map[string]any{
-		"iss": custIssuer, "sub": sub, "aud": "shop-bff",
+		"iss": custIssuer, "sub": sub, "aud": "shop-bff", "tenant": defaultTestTenant,
 		"iat": f.now.Unix(), "exp": f.now.Add(time.Minute).Unix(),
 	}
 	for k, v := range extra {
@@ -182,13 +187,24 @@ func (f *fixture) customerToken(sub string, extra map[string]any) string {
 func (f *fixture) employeeToken(sub string, extra map[string]any) string {
 	f.t.Helper()
 	claims := map[string]any{
-		"iss": empIssuer, "sub": sub, "aud": "internal-app",
+		"iss": empIssuer, "sub": sub, "aud": "internal-app", "tenant": defaultTestTenant,
 		"iat": f.now.Unix(), "exp": f.now.Add(time.Minute).Unix(),
 	}
 	for k, v := range extra {
 		claims[k] = v
 	}
 	return signUpstreamToken(f.t, f.empKey, jose.ES256, "emp-k1", claims)
+}
+
+// customerTokenNoTenant builds a customer token with NO tenant claim at
+// all, for the one test that specifically proves tenant is required.
+func (f *fixture) customerTokenNoTenant(sub string) string {
+	f.t.Helper()
+	claims := map[string]any{
+		"iss": custIssuer, "sub": sub, "aud": "shop-bff",
+		"iat": f.now.Unix(), "exp": f.now.Add(time.Minute).Unix(),
+	}
+	return signUpstreamToken(f.t, f.custKey, jose.ES256, "cust-k1", claims)
 }
 
 // form builds a valid POST /token body: a fresh client assertion plus the
@@ -510,7 +526,14 @@ func TestBothCanInvokeChecksMustPass(t *testing.T) {
 		}
 	})
 
-	t.Run("both permit: mints", func(t *testing.T) {
+	// Critical 1/2 fix round: when BOTH requested_subject and agent are
+	// present, the chain must be THREE levels — customer (sub) -> agent
+	// (act) -> employee (act.act), per RFC 8693 §4.1 (the current actor,
+	// the agent, sits outermost; the employee, who acted earlier to obtain
+	// this token, nests inside it). Asserting only `sub` here (as an
+	// earlier draft of this test did) cannot see a level that was never
+	// emitted at all — this is exactly the shape Critical 1 fixed.
+	t.Run("both permit: mints a THREE-level chain, sub/act/act.act", func(t *testing.T) {
 		authz := newFakeAuthz()
 		authz.allowSegment("customer:C-1", "retail-vip")
 		authz.allowSegment("employee:jdoe", "support-staff")
@@ -523,7 +546,77 @@ func TestBothCanInvokeChecksMustPass(t *testing.T) {
 		if got := str(claims, "sub"); got != "customer:C-1" {
 			t.Fatalf("sub = %q, want customer:C-1", got)
 		}
+		if got, ok := claims["garm"].(map[string]any); !ok || str(got, "clearance") == "" {
+			t.Fatalf("sub carries no usable garm claim: %v", claims["garm"])
+		}
+
+		act, ok := claims["act"].(map[string]any)
+		if !ok {
+			t.Fatal("no act level at all")
+		}
+		if got := str(act, "sub"); got != "agent:order-assistant" {
+			t.Fatalf("act.sub = %q, want agent:order-assistant — the agent is the CURRENT actor, outermost", got)
+		}
+		actGarm, ok := act["garm"].(map[string]any)
+		if !ok || str(actGarm, "clearance") == "" {
+			t.Fatalf("act (the agent) carries no usable garm claim: %v", act["garm"])
+		}
+
+		inner, ok := act["act"].(map[string]any)
+		if !ok {
+			t.Fatal("act.act is missing — the employee must be nested inside the agent's act level, not dropped")
+		}
+		if got := str(inner, "sub"); got != "employee:jdoe" {
+			t.Fatalf("act.act.sub = %q, want employee:jdoe — the employee is a PRIOR actor, nested", got)
+		}
+		innerGarm, ok := inner["garm"].(map[string]any)
+		if !ok || str(innerGarm, "clearance") == "" {
+			t.Fatalf("act.act (the employee) carries no usable garm claim: %v", inner["garm"])
+		}
 	})
+
+	// Critical 1/2 fix round: this is the regression this whole fix exists
+	// to close. Before it, the employee's own segment membership was never
+	// resolved on the delegating-with-agent path, so an employee in NO
+	// segment — who the DIRECT path already refuses via
+	// TestExchangeRefusesAPrincipalWithNoRoles — minted successfully here at
+	// the customer's full, unnarrowed authority. The employee's own
+	// entitlement must gate this path exactly as it gates the direct one.
+	t.Run("employee in no segment at all is refused, even though the customer is fully entitled", func(t *testing.T) {
+		authz := newFakeAuthz()
+		authz.allowSegment("customer:C-1", "retail-vip")
+		// Deliberately NOT calling authz.allowSegment for employee:jdoe: the
+		// employee belongs to no segment, so ForSegments("employee", nil)
+		// must refuse.
+		authz.allowHandledBy("employee:jdoe", "customer:C-1")
+		authz.allowInvoke("customer:C-1", "agent:order-assistant")
+		authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+		f := newFixture(t, exchangePolicy, authz, enforced)
+
+		resp := f.do(f.form(f.employeeToken("jdoe", nil), "customer:C-1", "order-assistant"))
+		if resp.StatusCode == http.StatusOK {
+			t.Fatal("minted a token though the acting employee belongs to no segment and has no authority of their own to assert")
+		}
+	})
+}
+
+// --- Important 3: tenant is required, never invented, never blank --------
+
+func TestExchangeRefusesASubjectTokenWithNoTenant(t *testing.T) {
+	// A verified upstream token with no `tenant` claim at all must refuse
+	// the mint outright rather than propagate an empty string: confinement
+	// to a tenant's own data depends on this value flowing from the token,
+	// so `"tenant":""` on a minted token is a confinement failure, not a
+	// cosmetic gap.
+	authz := newFakeAuthz()
+	authz.allowSegment("customer:C-1", "retail-vip")
+	authz.allowInvoke("customer:C-1", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	resp := f.do(f.form(f.customerTokenNoTenant("C-1"), "", "order-assistant"))
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("minted a token for a subject token that carries no tenant claim")
+	}
 }
 
 // --- Review Focus 1, at the handler --------------------------------------
