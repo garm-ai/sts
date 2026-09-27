@@ -41,6 +41,16 @@ const jwksCacheTTL = 5 * time.Minute
 // IdP per verification attempt.
 const unknownKidRefetchWindow = 30 * time.Second
 
+// defaultJWKSFetchTimeout bounds a single JWKS fetch when the caller does not
+// supply their own HTTPClient. A JWKS fetch is allowed to be slow — it is
+// off the hot path of any individual request, cached, and rate-limited — but
+// it must never be unbounded: http.DefaultClient has no timeout, and an IdP
+// that accepts a connection and never responds would otherwise hang every
+// verification for that issuer indefinitely, which is exactly the
+// availability problem the unknown-kid rate limit exists to prevent from the
+// other direction.
+const defaultJWKSFetchTimeout = 8 * time.Second
+
 // TrustedIssuer is one upstream identity provider this service accepts
 // tokens from.
 //
@@ -82,11 +92,22 @@ type UpstreamClaims struct {
 
 // jwksCache holds one issuer's fetched JWKS and the bookkeeping needed to
 // rate-limit refetches.
+//
+// mu guards only the fields below, never the network call itself: a fetch
+// runs with the lock released (see key), so a slow or hanging IdP for this
+// issuer cannot block unrelated lookups against the same cache that would
+// otherwise be answerable from a still-fresh copy, and cannot wedge the
+// per-issuer bookkeeping for other goroutines. fetchDone implements the
+// single-flight join: while non-nil, a fetch is already in progress and a
+// concurrent caller waits on it instead of starting a second one, then reads
+// fetchErr/keys once it closes.
 type jwksCache struct {
 	mu          sync.Mutex
 	keys        map[string]jose.JSONWebKey
 	fetchedAt   time.Time
 	lastAttempt time.Time
+	fetchDone   chan struct{}
+	fetchErr    error
 }
 
 // Verifier checks upstream tokens against their issuer's configured JWKS.
@@ -110,7 +131,7 @@ func NewVerifier(issuers []TrustedIssuer, opts VerifierOptions) *Verifier {
 		opts.Now = time.Now
 	}
 	if opts.HTTPClient == nil {
-		opts.HTTPClient = http.DefaultClient
+		opts.HTTPClient = &http.Client{Timeout: defaultJWKSFetchTimeout}
 	}
 
 	byIssuer := make(map[string]TrustedIssuer, len(issuers))
@@ -338,38 +359,83 @@ func (v *Verifier) keyFor(ctx context.Context, trusted TrustedIssuer, kid string
 //  4. An expired cache plus a failed refresh is a hard failure: this method
 //     never returns a key from c.keys after a failed fetch. There is no
 //     fallback path to stale keys.
+//
+// A fifth property, not in the original list but load-bearing for
+// availability: the mutex is never held across the network call. A fetch
+// runs unlocked; concurrent callers for the same issuer join it (single
+// flight) rather than each starting — and each blocking on — their own.
+// Combined with the caller-supplied or default-timeout http.Client, a
+// hanging IdP delays callers by at most that timeout, not forever.
 func (c *jwksCache) key(ctx context.Context, v *Verifier, trusted TrustedIssuer, kid string) (any, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	now := v.now()
 	fresh := !c.fetchedAt.IsZero() && now.Sub(c.fetchedAt) < jwksCacheTTL
 
 	if fresh {
 		if key, ok := c.keys[kid]; ok {
+			c.mu.Unlock()
 			return key.Key, nil
 		}
 	}
 
-	// The cache is either stale or missing this kid. Either way a fetch is
-	// needed, but it is rate-limited: without this, a token carrying a
-	// garbage kid could force one HTTP request per verification attempt.
+	// A fetch is already in flight (for a garbage kid, an expired cache, or
+	// simply a concurrent caller that got here first): join it instead of
+	// starting a second request against the same IdP.
+	if c.fetchDone != nil {
+		done := c.fetchDone
+		c.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, fmt.Errorf("jwks: %w", ctx.Err())
+		}
+		return c.lookupAfterFetch(trusted, kid)
+	}
+
+	// No fetch in flight. The cache is either stale or missing this kid.
+	// Either way a fetch is needed, but it is rate-limited: without this, a
+	// token carrying a garbage kid could force one HTTP request per
+	// verification attempt.
 	if !c.lastAttempt.IsZero() && now.Sub(c.lastAttempt) < unknownKidRefetchWindow {
+		c.mu.Unlock()
 		return nil, fmt.Errorf("jwks: issuer %q kid %q unavailable, refresh rate-limited until %s",
 			trusted.Issuer, kid, c.lastAttempt.Add(unknownKidRefetchWindow).UTC().Format(time.RFC3339))
 	}
 	c.lastAttempt = now
+	done := make(chan struct{})
+	c.fetchDone = done
+	c.mu.Unlock()
 
+	// The network call itself runs with the lock released.
 	keys, err := fetchJWKS(ctx, v.client, trusted.JWKSURL)
+
+	c.mu.Lock()
+	if err == nil {
+		// Never fall back to the old (expired, or kid-incomplete) key set:
+		// c.keys is replaced only on success.
+		c.keys = keys
+		c.fetchedAt = v.now()
+	}
+	c.fetchErr = err
+	c.fetchDone = nil
+	c.mu.Unlock()
+	close(done) // wake every goroutine that joined this fetch
+
+	return c.lookupAfterFetch(trusted, kid)
+}
+
+// lookupAfterFetch reads the outcome of the most recently completed fetch
+// (this goroutine's own, or one it joined) and resolves kid against it.
+func (c *jwksCache) lookupAfterFetch(trusted TrustedIssuer, kid string) (any, error) {
+	c.mu.Lock()
+	err := c.fetchErr
+	key, ok := c.keys[kid]
+	c.mu.Unlock()
+
 	if err != nil {
-		// Never fall back to the old (expired, or kid-incomplete) key set.
 		return nil, fmt.Errorf("jwks: refreshing issuer %q failed: %w", trusted.Issuer, err)
 	}
-
-	c.keys = keys
-	c.fetchedAt = now
-
-	key, ok := c.keys[kid]
 	if !ok {
 		return nil, fmt.Errorf("jwks: issuer %q has no key for kid %q", trusted.Issuer, kid)
 	}

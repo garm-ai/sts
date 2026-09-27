@@ -512,3 +512,190 @@ func TestVerifyFailsClosedWhenCacheExpiresAndRefreshFails(t *testing.T) {
 			"this must be a hard failure, never a fallback to the stale key")
 	}
 }
+
+// TestVerifyReturnsPromptlyWhenTheIdPHangs is the availability gap the other
+// direction from an unknown kid: a garbage kid must not let anyone hammer the
+// IdP with requests, but an IdP that accepts a connection and never responds
+// must also not be able to block verification forever. http.DefaultClient has
+// no timeout, so this only works if NewVerifier gives its default client one.
+func TestVerifyReturnsPromptlyWhenTheIdPHangs(t *testing.T) {
+	now := time.Now()
+	key := genUpstreamKey(t)
+
+	release := make(chan struct{})
+	hangingIdP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // never responds until the test says so
+	}))
+	t.Cleanup(func() {
+		close(release)
+		hangingIdP.Close()
+	})
+
+	trusted := sts.TrustedIssuer{
+		Issuer: "https://hanging.example", JWKSURL: hangingIdP.URL,
+		Audience: []string{"sts"}, Kind: "customer",
+	}
+	// A short client timeout stands in for the production default so this
+	// test doesn't have to wait out the real default to prove the point.
+	v := sts.NewVerifier([]sts.TrustedIssuer{trusted}, sts.VerifierOptions{
+		Now:        func() time.Time { return now },
+		HTTPClient: &http.Client{Timeout: 200 * time.Millisecond},
+	})
+
+	tok := signUpstreamToken(t, key, jose.ES256, "k1", claimsAt(trusted.Issuer, now, now.Add(time.Hour), nil))
+
+	start := time.Now()
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := v.Verify(context.Background(), tok)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("Verify() against a hanging IdP returned no error")
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("Verify() took %s to fail, want it bounded by the client timeout, not the test's own safety net", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Verify() did not return within 2s against a hanging IdP — it must be bounded by a timeout, never block indefinitely")
+	}
+}
+
+// TestVerifyOfADifferentIssuerIsUnaffectedByAHangingIdP proves the mutex
+// covering an issuer's JWKS cache is released for the duration of the network
+// fetch: a hang on one issuer must not stall a concurrent verification for a
+// completely unrelated, healthy issuer.
+func TestVerifyOfADifferentIssuerIsUnaffectedByAHangingIdP(t *testing.T) {
+	now := time.Now()
+	hangingKey := genUpstreamKey(t)
+	healthyKey := genUpstreamKey(t)
+
+	release := make(chan struct{})
+	hangingIdP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	t.Cleanup(func() {
+		close(release)
+		hangingIdP.Close()
+	})
+	healthyIdP := newTestIdP(t, upstreamJWK("k1", healthyKey))
+
+	hangingIssuer := sts.TrustedIssuer{
+		Issuer: "https://hanging.example", JWKSURL: hangingIdP.URL,
+		Audience: []string{"sts"}, Kind: "customer",
+	}
+	healthyIssuer := sts.TrustedIssuer{
+		Issuer: "https://healthy.example", JWKSURL: healthyIdP.server.URL,
+		Audience: []string{"sts"}, Kind: "customer",
+	}
+
+	// A client timeout much longer than this test's own patience, so a
+	// regression that serializes the two issuers behind one lock shows up as
+	// this test timing out, not as the client timeout quietly saving it.
+	v := sts.NewVerifier([]sts.TrustedIssuer{hangingIssuer, healthyIssuer}, sts.VerifierOptions{
+		Now:        func() time.Time { return now },
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+	})
+
+	hangingTok := signUpstreamToken(t, hangingKey, jose.ES256, "k1", claimsAt(hangingIssuer.Issuer, now, now.Add(time.Hour), nil))
+	healthyTok := signUpstreamToken(t, healthyKey, jose.ES256, "k1", claimsAt(healthyIssuer.Issuer, now, now.Add(time.Hour), nil))
+
+	go func() {
+		_, _, _ = v.Verify(context.Background(), hangingTok)
+	}()
+	time.Sleep(50 * time.Millisecond) // give it time to actually start the request
+
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := v.Verify(context.Background(), healthyTok)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Verify() of an unrelated, healthy issuer error = %v, want success", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Verify() of a different issuer blocked behind a hanging issuer's in-flight fetch")
+	}
+}
+
+// TestVerifyOfAnAlreadyCachedKidIsUnaffectedByAConcurrentSlowFetchOnTheSameIssuer
+// is the test that actually distinguishes "the mutex is released during the
+// fetch" from "the mutex is held across it": TestVerifyOfADifferentIssuerIsUn-
+// affectedByAHangingIdP above passes even if the lock were held across the
+// fetch, because each issuer already has its own jwksCache and mutex. Holding
+// the lock across the fetch only matters WITHIN one issuer's cache: a lookup
+// for a kid already cached and fresh must not wait behind a concurrent,
+// slow-or-hanging fetch for a different (unknown) kid on that SAME issuer.
+func TestVerifyOfAnAlreadyCachedKidIsUnaffectedByAConcurrentSlowFetchOnTheSameIssuer(t *testing.T) {
+	now := time.Now()
+	clock := func() time.Time { return now }
+	knownKey := genUpstreamKey(t)
+
+	var hang int32 // 0 = respond normally, 1 = hang until released
+	release := make(chan struct{})
+	knownJWK := upstreamJWK("known-kid", knownKey)
+	set := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{knownJWK.Public()}}
+	idp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.LoadInt32(&hang) == 1 {
+			<-release
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(set)
+	}))
+	t.Cleanup(func() {
+		close(release)
+		idp.Close()
+	})
+
+	trusted := sts.TrustedIssuer{
+		Issuer: "https://idp.example", JWKSURL: idp.URL,
+		Audience: []string{"sts"}, Kind: "customer",
+	}
+	v := sts.NewVerifier([]sts.TrustedIssuer{trusted}, sts.VerifierOptions{
+		Now:        clock,
+		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+	})
+
+	knownTok := signUpstreamToken(t, knownKey, jose.ES256, "known-kid", claimsAt(trusted.Issuer, now, now.Add(time.Hour), nil))
+
+	// Populate the cache with known-kid while the IdP responds normally.
+	if _, _, err := v.Verify(context.Background(), knownTok); err != nil {
+		t.Fatalf("initial Verify() error = %v", err)
+	}
+
+	// Advance the fake clock past the unknown-kid refetch rate-limit window
+	// (so the garbage-kid lookup below actually reaches the network instead
+	// of being rejected outright by the rate limiter) but stay within the
+	// JWKS cache TTL (so known-kid stays servable straight from cache).
+	now = now.Add(35 * time.Second)
+
+	atomic.StoreInt32(&hang, 1)
+	garbageTok := signUpstreamToken(t, knownKey, jose.ES256, "garbage-kid", claimsAt(trusted.Issuer, now, now.Add(time.Hour), nil))
+	go func() {
+		_, _, _ = v.Verify(context.Background(), garbageTok)
+	}()
+	time.Sleep(100 * time.Millisecond) // let it actually start the hanging request
+
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := v.Verify(context.Background(), knownTok)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Verify() of an already-cached kid error = %v, want success", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Verify() of an already-cached kid blocked behind a concurrent slow fetch " +
+			"for a different kid on the same issuer — the cache mutex must not be held across the network call")
+	}
+}
