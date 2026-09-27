@@ -101,6 +101,13 @@ type UpstreamClaims struct {
 // single-flight join: while non-nil, a fetch is already in progress and a
 // concurrent caller waits on it instead of starting a second one, then reads
 // fetchErr/keys once it closes.
+//
+// Known limitation, not addressed here: the shared fetch runs on the
+// LEADER's context (see fetchAndStore's caller in key), so a joiner whose
+// own context is still live can still fail if the leader's context is
+// cancelled first. Fine for now — every joiner still gets a prompt answer,
+// just occasionally the wrong reason — but worth revisiting if leaders and
+// joiners start carrying meaningfully different deadlines.
 type jwksCache struct {
 	mu          sync.Mutex
 	keys        map[string]jose.JSONWebKey
@@ -407,22 +414,58 @@ func (c *jwksCache) key(ctx context.Context, v *Verifier, trusted TrustedIssuer,
 	c.fetchDone = done
 	c.mu.Unlock()
 
-	// The network call itself runs with the lock released.
-	keys, err := fetchJWKS(ctx, v.client, trusted.JWKSURL)
-
-	c.mu.Lock()
-	if err == nil {
-		// Never fall back to the old (expired, or kid-incomplete) key set:
-		// c.keys is replaced only on success.
-		c.keys = keys
-		c.fetchedAt = v.now()
-	}
-	c.fetchErr = err
-	c.fetchDone = nil
-	c.mu.Unlock()
-	close(done) // wake every goroutine that joined this fetch
+	// The network call itself runs with the lock released. fetchAndStore
+	// guarantees fetchDone is cleared and done is closed on every exit path,
+	// a panic from fetchJWKS included — see its doc comment for why that
+	// matters.
+	c.fetchAndStore(ctx, v, trusted, done)
 
 	return c.lookupAfterFetch(trusted, kid)
+}
+
+// fetchAndStore runs the network fetch and records its outcome, then wakes
+// every goroutine waiting on done.
+//
+// The cleanup (recording fetchErr/keys, clearing fetchDone, closing done) is
+// entirely inside a deferred func, so it runs even if fetchJWKS panics —
+// without that, a leader that panics mid-fetch would leave fetchDone set
+// forever and every joiner blocked on <-done with no deadline, reintroducing
+// the exact indefinite-hang class the single-flight design was built to
+// close, just from a different cause. The panic itself is deliberately not
+// swallowed: recover() only lets the cleanup run, then the same value is
+// re-panicked so it still surfaces to the leader's own caller as a bug, not
+// as a quietly-failed fetch.
+func (c *jwksCache) fetchAndStore(ctx context.Context, v *Verifier, trusted TrustedIssuer, done chan struct{}) {
+	var keys map[string]jose.JSONWebKey
+	var err error
+
+	defer func() {
+		r := recover()
+		if r != nil {
+			// The fetch never completed normally; a joiner must see a
+			// failure for THIS round, never a stale result left over from
+			// some earlier fetch.
+			err = fmt.Errorf("jwks: fetch panicked: %v", r)
+		}
+
+		c.mu.Lock()
+		if err == nil {
+			// Never fall back to the old (expired, or kid-incomplete) key
+			// set: c.keys is replaced only on success.
+			c.keys = keys
+			c.fetchedAt = v.now()
+		}
+		c.fetchErr = err
+		c.fetchDone = nil
+		c.mu.Unlock()
+		close(done) // wake every goroutine that joined this fetch
+
+		if r != nil {
+			panic(r)
+		}
+	}()
+
+	keys, err = fetchJWKS(ctx, v.client, trusted.JWKSURL)
 }
 
 // lookupAfterFetch reads the outcome of the most recently completed fetch

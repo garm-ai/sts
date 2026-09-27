@@ -699,3 +699,98 @@ func TestVerifyOfAnAlreadyCachedKidIsUnaffectedByAConcurrentSlowFetchOnTheSameIs
 			"for a different kid on the same issuer — the cache mutex must not be held across the network call")
 	}
 }
+
+// panickingRoundTripper is a test-only http.RoundTripper that synchronizes
+// with the test (closing ready once it's about to panic, then waiting for
+// the test's go-ahead) so a test can guarantee a joiner observes the fetch
+// still in flight before the panic actually happens.
+type panickingRoundTripper struct {
+	ready chan struct{}
+	go_   chan struct{}
+}
+
+func (rt *panickingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	close(rt.ready)
+	<-rt.go_
+	panic("panickingRoundTripper: injected failure")
+}
+
+// TestVerifyJoinerIsReleasedAndLeaderPanicPropagatesWhenTheFetchPanics covers
+// the failure mode a plain single-flight join introduces: if the leader's
+// fetch panics instead of returning an error, and the cleanup that clears
+// fetchDone/closes done is not guaranteed to run on every exit path, every
+// joiner waiting on <-done blocks forever — reintroducing an indefinite hang
+// by a new mechanism, right after the previous round closed one. This test
+// asserts BOTH halves of the required fix: a joiner is released with an
+// error (not left hanging), AND the leader's own panic is not swallowed.
+func TestVerifyJoinerIsReleasedAndLeaderPanicPropagatesWhenTheFetchPanics(t *testing.T) {
+	now := time.Now()
+	key := genUpstreamKey(t)
+
+	rt := &panickingRoundTripper{ready: make(chan struct{}), go_: make(chan struct{})}
+	trusted := sts.TrustedIssuer{
+		Issuer: "https://idp.example", JWKSURL: "http://jwks.invalid/keys",
+		Audience: []string{"sts"}, Kind: "customer",
+	}
+	v := sts.NewVerifier([]sts.TrustedIssuer{trusted}, sts.VerifierOptions{
+		Now:        func() time.Time { return now },
+		HTTPClient: &http.Client{Transport: rt},
+	})
+
+	tok := signUpstreamToken(t, key, jose.ES256, "k1", claimsAt(trusted.Issuer, now, now.Add(time.Hour), nil))
+
+	// The leader: its Verify call reaches the network, blocks in
+	// panickingRoundTripper.RoundTrip until the test lets it proceed, then
+	// panics. A recover() here is ONLY to observe whether the panic reached
+	// this goroutine — it must not be mistaken for the package itself
+	// recovering it.
+	leaderDone := make(chan struct{})
+	var leaderPanicked bool
+	go func() {
+		defer func() {
+			if recover() != nil {
+				leaderPanicked = true
+			}
+			close(leaderDone)
+		}()
+		_, _, _ = v.Verify(context.Background(), tok)
+	}()
+
+	// Wait until the leader has actually reached the network call — i.e.
+	// fetchDone is guaranteed set — before starting the joiner.
+	select {
+	case <-rt.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader never reached the network call")
+	}
+
+	// The joiner: same issuer, same kid, concurrent with the still-in-flight
+	// (panic-pending) leader fetch. It must join rather than start its own.
+	joinerResult := make(chan error, 1)
+	go func() {
+		_, _, err := v.Verify(context.Background(), tok)
+		joinerResult <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // give it time to actually reach the join point
+
+	close(rt.go_) // let the leader's RoundTrip panic now
+
+	select {
+	case err := <-joinerResult:
+		if err == nil {
+			t.Fatal("joiner Verify() succeeded against a fetch that panicked")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("joiner Verify() hung forever after the leader's fetch panicked — " +
+			"fetchDone must be cleared and done closed on every exit path, including a panic")
+	}
+
+	select {
+	case <-leaderDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader goroutine never completed")
+	}
+	if !leaderPanicked {
+		t.Fatal("leader Verify() did not panic — a panic from the fetch must propagate to the leader's caller, not be swallowed")
+	}
+}
