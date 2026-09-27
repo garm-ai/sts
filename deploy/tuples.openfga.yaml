@@ -1,0 +1,14 @@
+# Sample OpenFGA relationship tuples. Write with the fga CLI.
+# fga tuple write --store-id <id> --file deploy/tuples.openfga.yaml
+- user: segment:retail#member
+  relation: invokable_by
+  object: agent:order-assistant
+- user: customer:C
+  relation: member
+  object: segment:retail
+- user: runner:agent-runner
+  relation: runnable_by
+  object: agent:order-assistant
+- user: employee:jdoe
+  relation: handled_by
+  object: customer:C

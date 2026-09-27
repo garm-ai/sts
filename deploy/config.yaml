@@ -1,0 +1,62 @@
+# STS configuration. $VARS are expanded from the environment at load.
+# Signing seeds NEVER live in this file — only the names of env vars holding them.
+issuer: https://sts.internal.example.com
+listen: :8443
+
+keys:
+  active: k1
+  ed25519:
+    - kid: k1
+      seedEnv: STS_SIGN_SEED_K1     # base64 of 32 random bytes: head -c32 /dev/urandom | base64
+    # - kid: k0                     # keep the previous key here during rotation
+    #   seedEnv: STS_SIGN_SEED_K0
+
+ttl:
+  delegation: 10m
+  obo: 5m
+
+# Upstream issuers whose tokens we accept as subject_token / actor_token.
+issuers:
+  - name: customer                  # e.g. Zitadel — the customer IdP
+    iss: https://auth.example.com
+    jwks: https://auth.example.com/oauth/v2/keys
+    audience: [shop-bff]            # the BFF's own access token audience
+
+  - name: employee                  # e.g. Microsoft Entra ID — the workforce IdP
+    iss: https://login.microsoftonline.com/<tenant-id>/v2.0
+    jwks: https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys
+    audience: [api://internal-app]
+
+  - name: runner-k8s                # projected service-account tokens
+    iss: https://kubernetes.default.svc.cluster.local
+    jwks: https://kubernetes.default.svc.cluster.local/openid/v1/jwks
+    audience: [sts]
+
+  - name: runner-spire              # SPIRE JWT-SVIDs (bare-metal edge)
+    iss: https://spire.example.com
+    jwks: https://spire-oidc.example.com/keys
+    audience: [sts]
+
+# BFFs allowed to perform exchange 1, authenticated with private_key_jwt.
+# keys: inline PEM public keys, or paths to PEM files.
+clients:
+  - id: shop-bff
+    keys: [./clients/shop-bff.pub.pem]
+  - id: internal-app
+    keys: [./clients/internal-app.pub.pem]
+
+# Audiences the STS mints for. "obo" targets require an actor_token.
+# An audience starting with "agent:" (see AgentAudPrefix) is a delegation target.
+targets:
+  - audience: nats
+    flow: obo
+    scopeCeiling: [orders:read, orders:write, order_state:read]
+
+authz:
+  # non-openfga build: flat tuple file
+  static: ./deploy/tuples.yaml
+  # openfga build (-tags openfga): live relationship checks
+  openfga:
+    apiUrl: http://openfga:8080
+    storeId: ${OPENFGA_STORE_ID}
+    modelId: ${OPENFGA_MODEL_ID}

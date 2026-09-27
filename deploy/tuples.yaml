@@ -1,0 +1,7 @@
+# Flat tuples for the StaticAuthorizer (dev / CI, non-openfga build).
+# The static checker does NOT resolve the graph, so write the RESOLVED relations
+# (e.g. the customer's entitlement directly, not via segment membership).
+relations:
+  - agent:order-assistant#can_invoke@customer:C        # gate 1
+  - agent:order-assistant#can_run@runner:agent-runner  # gate 3
+  - customer:C#handled_by@employee:jdoe                # employee-for-customer authority
