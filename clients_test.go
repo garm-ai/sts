@@ -269,6 +269,43 @@ func TestAuthenticateRejectsAnAssertionWithAnExpFurtherThanTheBoundedWindow(t *t
 	}
 }
 
+// TestAuthenticateReplayCacheIsNamespacedByClient proves the replay cache is
+// keyed on (client id, jti), not on jti alone: jti uniqueness is only ever
+// guaranteed PER CLIENT, never globally, so two different, entirely
+// legitimate clients whose assertions happen to carry the same jti value
+// must both be accepted. The second half matters just as much as the
+// first: a fix that merely namespaces the key without preserving per-client
+// replay refusal would still let each client replay its own assertion
+// forever.
+func TestAuthenticateReplayCacheIsNamespacedByClient(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	keyA := genUpstreamKey(t)
+	keyB := genUpstreamKey(t)
+	r := newTestRegistry(t, func() time.Time { return now },
+		sts.ClientConfig{ID: "shop-bff", PEMs: [][]byte{clientPublicKeyPEM(t, keyA)}},
+		sts.ClientConfig{ID: "loyalty-bff", PEMs: [][]byte{clientPublicKeyPEM(t, keyB)}},
+	)
+
+	const sharedJTI = "collides-across-clients"
+	assertionA := clientAssertion(t, keyA, "shop-bff", testAudience, now.Add(time.Minute), sharedJTI)
+	assertionB := clientAssertion(t, keyB, "loyalty-bff", testAudience, now.Add(time.Minute), sharedJTI)
+
+	if _, err := r.Authenticate(assertionA); err != nil {
+		t.Fatalf("Authenticate(shop-bff) error = %v, want acceptance — a jti collision with an UNRELATED client must not matter", err)
+	}
+	if _, err := r.Authenticate(assertionB); err != nil {
+		t.Fatalf("Authenticate(loyalty-bff) error = %v, want acceptance — same jti value as shop-bff's, but a different client entirely", err)
+	}
+
+	// Per-client replay refusal must still hold for each of them.
+	if _, err := r.Authenticate(assertionA); err == nil {
+		t.Fatal("Authenticate(shop-bff) accepted its own assertion a second time — namespacing the cache must not weaken per-client replay refusal")
+	}
+	if _, err := r.Authenticate(assertionB); err == nil {
+		t.Fatal("Authenticate(loyalty-bff) accepted its own assertion a second time — namespacing the cache must not weaken per-client replay refusal")
+	}
+}
+
 func TestNewClientRegistryRejectsAClientWithNoRegisteredKeys(t *testing.T) {
 	_, err := sts.NewClientRegistry([]sts.ClientConfig{{ID: "shop-bff", PEMs: nil}}, sts.ClientOptions{
 		Audience: testAudience,

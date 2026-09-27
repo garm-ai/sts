@@ -78,8 +78,15 @@ type ClientRegistry struct {
 
 	byID map[string][]any // client id -> parsed, registered public keys
 
-	mu   sync.Mutex
-	seen map[string]time.Time // spent jti -> the expiry it was recorded with
+	mu sync.Mutex
+	// seen is keyed by (client id, jti), not by jti alone: jti uniqueness is
+	// only ever guaranteed PER CLIENT (RFC 7523 leaves it to the issuer to
+	// pick, exactly as RFC 7519's jti does for any issuer), never globally.
+	// Keying on the bare jti would make one client's assertion fail as
+	// "already used" whenever its jti happened to collide with a completely
+	// unrelated client's — fail-closed, not a bypass, but an unspecified and
+	// unnecessary cross-client interaction.
+	seen map[[2]string]time.Time // (client id, jti) -> the expiry it was recorded with
 }
 
 // NewClientRegistry parses every client's registered PEM-encoded public keys
@@ -125,7 +132,7 @@ func NewClientRegistry(clients []ClientConfig, opts ClientOptions) (*ClientRegis
 		now:      opts.Now,
 		jtiTTL:   opts.JTITTL,
 		byID:     byID,
-		seen:     make(map[string]time.Time),
+		seen:     make(map[[2]string]time.Time),
 	}, nil
 }
 
@@ -245,15 +252,22 @@ func (r *ClientRegistry) Authenticate(assertion string) (string, error) {
 		return "", fmt.Errorf("clients: assertion has no jti")
 	}
 
-	if err := r.spend(jti, exp); err != nil {
+	if err := r.spend(iss, jti, exp); err != nil {
 		return "", err
 	}
 
 	return iss, nil
 }
 
-// spend records jti as used, refusing a replay, and evicts every jti whose
-// own recorded expiry has already passed.
+// spend records (clientID, jti) as used, refusing a replay, and evicts every
+// entry whose own recorded expiry has already passed.
+//
+// The "have I seen this" check and the "record it" write happen inside one
+// uninterrupted critical section (a single held r.mu), which is what makes
+// this race-free by construction: two concurrent presentations of the same
+// assertion cannot both observe an empty slot and both proceed to record
+// it — one always executes its lookup-and-set before the other's lookup can
+// begin, so a genuine race between them still yields exactly one success.
 //
 // Eviction runs inline, on every call, rather than on a timer: this cache is
 // reachable by anyone who can reach the token endpoint, so bounding its size
@@ -261,8 +275,9 @@ func (r *ClientRegistry) Authenticate(assertion string) (string, error) {
 // might not run often enough. An entry is removed at its OWN exp, which is
 // itself bounded by JTITTL — never retained "just in case" beyond the
 // window the assertion itself claimed to be valid for.
-func (r *ClientRegistry) spend(jti string, exp time.Time) error {
+func (r *ClientRegistry) spend(clientID, jti string, exp time.Time) error {
 	now := r.now()
+	key := [2]string{clientID, jti}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -273,9 +288,9 @@ func (r *ClientRegistry) spend(jti string, exp time.Time) error {
 		}
 	}
 
-	if _, alreadyUsed := r.seen[jti]; alreadyUsed {
-		return fmt.Errorf("clients: jti %q has already been used", jti)
+	if _, alreadyUsed := r.seen[key]; alreadyUsed {
+		return fmt.Errorf("clients: jti %q for client %q has already been used", jti, clientID)
 	}
-	r.seen[jti] = exp
+	r.seen[key] = exp
 	return nil
 }
