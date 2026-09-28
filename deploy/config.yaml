@@ -7,7 +7,15 @@
 # that ends up in a bug report, a wiki, or a screenshot. Run deploy/keygen.sh
 # to generate one.
 issuer: https://sts.internal.example.com
-audience: garm://garmd # garmd's own identifier; every minted token's `aud`, never the agent
+# garmd's own identifier; every minted token's `aud`, never the agent.
+#
+# !! garmd MUST be started with --audience garm://garmd (or whatever this
+# !! field is set to). garmd's --audience flag DEFAULTS TO "garm", and a
+# !! garmd left on that default refuses EVERY token this service mints, on
+# !! audience mismatch. That is correct behaviour and a miserable thing to
+# !! debug: nothing is wrong with the token, the signing key, or the
+# !! exchange — the two sides simply disagree about who the audience is.
+audience: garm://garmd
 listen: :8080 # plaintext for local dev; set STS_TLS_CERT/STS_TLS_KEY in production — see cmd/sts/main.go
 tokenEndpointAudience: https://sts.internal.example.com/token # the `aud` a BFF's client_assertion must carry to call POST /token
 

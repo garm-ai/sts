@@ -1,5 +1,8 @@
-# Static authorization tuples for LoadStaticAuthorizer (dev / CI; the
-# OpenFGA-backed implementation is a later, build-tagged task). This checker
+# Static authorization tuples for LoadStaticAuthorizer — the authorizer an
+# UNTAGGED sts build uses, for development and CI. The production authorizer
+# is the OpenFGA-backed one, compiled in by -tags openfga; it reads the same
+# facts from a live store (deploy/model.fga, deploy/tuples.openfga.yaml), and
+# authz_openfga_parity_test.go proves the two agree. This checker
 # does not resolve any graph — every relation must be written in its
 # already-resolved form, not derived from another one (e.g. a customer's
 # segment membership does not by itself grant that customer's employees

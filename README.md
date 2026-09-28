@@ -95,13 +95,19 @@ entirely:
   implements exchange 1 only.
 - **The runner / agent-runner broker** is not part of this service.
 - **The NATS auth callout integration** is not part of this service.
-- **An OpenFGA-backed `Authorizer`** is not built yet. The only
-  implementation today is `LoadStaticAuthorizer` (`authz_static.go`): a
-  flat YAML file of already-resolved tuples (see `deploy/tuples.yaml`) — it
-  does not resolve any graph, so a segment granting an agent entitlement is
-  not followed transitively; every relation must be written in its
-  already-resolved form. OpenFGA arrives in a later task, wired in through
-  the same `Authorizer` interface, chosen by `cmd/sts/main.go`.
+- **A second `Authorizer` implementation beyond these two.** There are
+  two, and which one a binary has is fixed when it is built, not at
+  runtime. An **untagged** build uses `LoadStaticAuthorizer`
+  (`authz_static.go`): a flat YAML file of already-resolved tuples (see
+  `deploy/tuples.yaml`) — it resolves no graph, so a segment granting an
+  agent entitlement is not followed transitively; every relation must be
+  written in its already-resolved form. That is the dev/CI authorizer. A
+  build with **`-tags openfga`** uses the OpenFGA-backed one
+  (`authz_openfga.go`), against `deploy/model.fga`'s relations — that is
+  the production authorizer, and `authz_openfga_parity_test.go` proves the
+  two answer the same questions identically. The two build files
+  (`cmd/sts/authz_static.go`, `cmd/sts/authz_openfga.go`) carry mutually
+  exclusive build tags, so exactly one is ever compiled in.
 
 ## `instanceAuthorization` — and why it exists
 
@@ -142,33 +148,65 @@ below is a hard failure at startup with a message naming the field, not a
 mysterious failure discovered at the first request:
 
 - `issuer`, `audience`, `tokenEndpointAudience`, `listen`
+
+  > **`audience` must match garmd's `--audience`.** This service ships
+  > `audience: garm://garmd`, and `garmd`'s `--audience` flag **defaults to
+  > `garm`**. A garmd started on that default refuses *every* token this
+  > service mints, on audience mismatch — correct behaviour, and thoroughly
+  > mystifying to debug, since nothing is wrong with the token, the key, or
+  > the exchange. Start garmd with `--audience garm://garmd`, or whatever
+  > this service's `audience` is set to. The value here is deliberately not
+  > changed to garmd's default: `garm://garmd` is the more correct
+  > identifier, and garmd's audience is explicitly configurable.
 - `keys.active` and `keys.keys[]` — at least one signing key; `active` must
   name one of them. **Signing keys are never inlined.** Each key's `pem`
   field is a reference to an environment variable (`$NAME` or `${NAME}`)
   holding the PEM-encoded ECDSA P-256 private key — `LoadConfig` rejects
   literal key material in this field outright. Retired keys can stay listed
   (served for verification, never signed with) during rotation.
-- `issuers[]` — at least one trusted upstream issuer, each with a `kind` of
-  `customer` or `employee`.
-- `clients[]` — BFFs allowed to authenticate with `private_key_jwt`. Client
-  keys are *public* keys, not secrets, so they may be a file path or
-  inlined PEM directly.
+- `issuers[]` — at least one trusted upstream issuer, each with a non-empty
+  `audience` and a `kind` of `customer` or `employee`. Two entries may not
+  share an `iss`: the verifier keys on it, so a duplicate would silently
+  keep only the last entry's `kind` — and `kind` decides whether
+  `instanceAuthorization`'s clearance cap applies.
+- `clients[]` — at least one BFF allowed to authenticate with
+  `private_key_jwt`. Client keys are *public* keys, not secrets, so they
+  may be a file path or inlined PEM directly. A config with no clients
+  would serve a JWKS and deny every `POST /token` as an unknown client, so
+  an empty list is a startup failure.
 - `policy` — path to the claims policy file (`LoadPolicy`, `claims.go`).
 - `authz.static` — path to the static authorizer tuples file
-  (`LoadStaticAuthorizer`, `authz_static.go`).
+  (`LoadStaticAuthorizer`, `authz_static.go`). Used by an **untagged**
+  build. Required in every config, since `LoadConfig` does not know which
+  binary will read it.
+- `authz.openfga.apiUrl`, `authz.openfga.storeId`, `authz.openfga.modelId`
+  — the OpenFGA store the **`-tags openfga`** build checks against.
+  `LoadConfig` always parses this block; an untagged binary ignores it
+  entirely, and an `-tags openfga` binary refuses to start without
+  `apiUrl` and `storeId`. `modelId` is optional but should be set in
+  production: an unpinned store silently reinterprets every check the
+  moment a new model version is written.
 - `instanceAuthorization.status` — must be exactly `enforced` or `absent`.
 - `instanceAuthorization.unconfinedCeiling` — if set, must be one of the
   four clearance names.
 
 `(*Config).Build(ctx, authz)` wires a loaded `Config` into a running
 `*Server`. It takes the `Authorizer` as a parameter rather than building one
-itself: which implementation to use (the static one today) is a decision
-`cmd/sts/main.go` makes, not `Config`'s.
+itself: which implementation a binary has is decided by its build tag —
+static when untagged, OpenFGA under `-tags openfga` — in
+`cmd/sts/authz_static.go` / `cmd/sts/authz_openfga.go`, not by `Config`.
 
 ## Running it
 
 ```bash
+# The dev/CI binary: the flat, file-backed authorizer (deploy/tuples.yaml).
 go build ./cmd/sts
+
+# The production binary: the OpenFGA-backed authorizer. Same binary name,
+# same config file, different Authorizer compiled in — it additionally
+# requires authz.openfga.apiUrl and authz.openfga.storeId to be set, and
+# refuses to start without them.
+go build -tags openfga ./cmd/sts
 
 # Generate an ES256 signing key and a BFF client keypair. Both must be
 # ECDSA (or RSA) — EdDSA is deliberately excluded from every algorithm
@@ -178,6 +216,12 @@ export STS_SIGN_KEY_K1="$(cat sts-sign-k1.pem)"
 
 ./sts -config deploy/config.yaml
 ```
+
+Whichever build you run, **start `garmd` with `--audience garm://garmd`**
+(or whatever this service's `audience` is configured to mint). `garmd`'s
+own default is `garm`, and a garmd left on it rejects every token from this
+service on audience mismatch — see the note in the Configuration section
+above.
 
 ```bash
 curl -s localhost:8080/.well-known/jwks.json
@@ -203,16 +247,19 @@ timeout for in-flight requests to finish.
 | `issuer.go` | Verifies upstream tokens against their issuer's JWKS |
 | `claims.go` | The claims policy: roles, segments, agent authority |
 | `authz.go` | The `Authorizer` interface — three yes/no questions |
-| `authz_static.go` | A flat, file-backed `Authorizer` (dev/CI) |
+| `authz_static.go` | A flat, file-backed `Authorizer` (dev/CI; untagged builds) |
+| `authz_openfga.go` | The OpenFGA-backed `Authorizer` (production; `-tags openfga`) |
 | `clients.go` | `private_key_jwt` client authentication + replay protection |
 | `exchange.go` | The `POST /token` handler: the whole exchange, in order |
 | `config.go` | Loads and validates `deploy/config.yaml`'s shape, wires a `Server` |
 | `cmd/sts/main.go` | The binary: flags, logging, TLS, graceful shutdown |
+| `cmd/sts/authz_static.go`, `cmd/sts/authz_openfga.go` | Which `Authorizer` this build gets — mutually exclusive build tags |
 | `deploy/config.yaml` | A complete, loadable example configuration |
 | `deploy/claims.yaml` | An example claims policy |
 | `deploy/tuples.yaml` | An example static-authorizer tuple file |
 | `deploy/keygen.sh` | Generates a signing key and a BFF client keypair |
-| `deploy/model.fga`, `deploy/tuples.openfga.yaml` | Sketches for the OpenFGA authorizer — **not built yet**; not currently loaded by anything |
+| `deploy/model.fga` | The OpenFGA authorization model backing the three `Authorizer` checks |
+| `deploy/tuples.openfga.yaml` | The same example facts as `deploy/tuples.yaml`, in OpenFGA's derived encoding |
 
 ## Security notes
 
