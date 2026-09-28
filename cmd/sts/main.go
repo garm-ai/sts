@@ -1,8 +1,9 @@
-// Command sts is a small RFC 8693 security token service. It verifies a
-// customer or employee token against its issuer's JWKS, checks entitlement
-// against the configured Authorizer, and mints a short-lived delegation
-// token carrying the `garm` claim and the act chain — exchange 1 only (see
-// README.md for what is and is not built).
+// Command sts is a small RFC 8693 security token service. It mints the
+// delegation token garmd verifies, through either of two doors — a BFF
+// presenting a verified human token (exchange 1), or a registered runner
+// naming a subject it was handed (exchange 2, which adds the `exec` claim)
+// — and it mints the approval grants garmd spends, at POST /approve. See
+// README.md.
 package main
 
 import (
@@ -54,11 +55,14 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/token", srv.Handler())
+	// The approval endpoint. Same keyring, same client registry, same
+	// opaque denial — a different credential entirely (see approve.go).
+	mux.Handle("/approve", srv.ApproveHandler())
 	mux.Handle("/.well-known/jwks.json", srv.Keyring().Handler())
 	// Published so a verifier can check, at ITS startup, that it was
 	// configured to expect what this service actually mints. See metadata.go.
 	mux.Handle("/.well-known/oauth-authorization-server",
-		srv.MetadataHandler(cfg.Issuer+"/.well-known/jwks.json", cfg.Issuer+"/token"))
+		srv.MetadataHandler(cfg.Issuer+"/.well-known/jwks.json", cfg.Issuer+"/token", cfg.Issuer+"/approve"))
 
 	h := &http.Server{
 		Addr:              cfg.Listen,

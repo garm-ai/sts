@@ -268,13 +268,6 @@ The grant itself:
   service. This service mints *for* a runner (the governed door above); it
   does not execute agents, and it has no view of whether a run happened.
 - **The NATS auth callout integration** is not part of this service.
-- **`/approve` is not mounted yet.** The handler exists
-  (`(*Server).ApproveHandler()`, `approve.go`) and is fully tested, but
-  `cmd/sts/main.go` still serves only `/token`, the JWKS and the metadata
-  document, and `Config` has no `approveTTL` key — so a deployed binary
-  answers `404` on `/approve` and `Options.ApproveTTL` can only be set by a
-  caller constructing `Options` directly. Mounting it and wiring the TTL
-  through configuration is the next step.
 - **Deciding whether an approver is allowed to approve.** This service
   *attests* — it records who approved and what authority their own token
   asserted — and `garmd` *decides*, because the catalogue is what knows
@@ -384,6 +377,15 @@ mysterious failure discovered at the first request:
 - `instanceAuthorization.status` — must be exactly `enforced` or `absent`.
 - `instanceAuthorization.unconfinedCeiling` — if set, must be one of the
   four clearance names.
+- `approve.ttl_seconds` — how long a `POST /approve` grant is valid.
+  Snake_case where its neighbours are camelCase: the cross-repository
+  interface contract names it that way, and renaming it would rename an
+  operator's key out from under them. Omitted (or `0`), it is `NewServer`'s
+  own default (15 minutes) rather than a second default living here — a
+  config that omits the key and a `Server` built directly in Go cannot
+  disagree about it. This is only ever a floor on staleness: a tool's own
+  `max_grant_age_seconds` is a ceiling `POST /approve` cannot raise, so a
+  generous value here still yields whatever a stricter tool asks for.
 
 `(*Config).Build(ctx, authz)` wires a loaded `Config` into a running
 `*Server`. It takes the `Authorizer` as a parameter rather than building one

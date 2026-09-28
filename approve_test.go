@@ -2,7 +2,9 @@ package sts_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/garm-ai/garm/contracts/grant"
+	"github.com/garm-ai/sts"
 	jose "github.com/go-jose/go-jose/v4"
 )
 
@@ -189,8 +192,12 @@ func TestApproveRefusesANonEmployeeApprover(t *testing.T) {
 	bearer := f.customerToken("C-8123", map[string]any{"garm": approverGarm("RESTRICTED", "financial")})
 
 	resp := f.approve(bearer, f.approveBody("payments.v1.initiate_payment", "customer:C-8123", bankMaterial()))
-	if resp.StatusCode == http.StatusOK {
-		t.Fatal("minted a grant for a customer-kind approver; a customer cannot approve a payment")
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 — a customer cannot approve a payment", resp.StatusCode)
+	}
+	if got := strings.TrimSpace(string(body)); got != `{"error":"access_denied"}` {
+		t.Fatalf("body = %q, want the single opaque denial", got)
 	}
 }
 
@@ -209,8 +216,12 @@ func TestApproveRefusesADelegatedApprover(t *testing.T) {
 			"act":  act,
 		})
 		resp := f.approve(bearer, f.approveBody("payments.v1.initiate_payment", "customer:C-8123", bankMaterial()))
-		if resp.StatusCode == http.StatusOK {
-			t.Fatalf("minted a grant from an approver token carrying act %v; a delegated identity may not approve, and minting one launders a delegated identity through a clean grant", act)
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (act %v); a delegated identity may not approve, and minting one launders a delegated identity through a clean grant", resp.StatusCode, act)
+		}
+		if got := strings.TrimSpace(string(body)); got != `{"error":"access_denied"}` {
+			t.Fatalf("body = %q, want the single opaque denial (act %v)", got, act)
 		}
 	}
 }
@@ -486,4 +497,96 @@ func TestApproveBuildsTheApproverIdentityFromTheIssuersKind(t *testing.T) {
 			}
 		}
 	})
+}
+
+// newFixtureWithApproveTTL is newFixture but rebuilds the server with a
+// non-default Options.ApproveTTL, reusing every other dependency the first
+// build already validated (the same pattern as newFixtureWithLog in
+// exchange_test.go).
+func newFixtureWithApproveTTL(t *testing.T, policyYAML string, authz *fakeAuthz, instance sts.InstanceAuthzConfig, ttl time.Duration) *fixture {
+	t.Helper()
+	f := newFixture(t, policyYAML, authz, instance)
+
+	srv, err := sts.NewServer(sts.Options{
+		Issuer:        stsIssuer,
+		Audience:      garmAudience,
+		Keyring:       f.kr,
+		Verifier:      f.verifierOf(t, policyYAML),
+		Policy:        loadPolicy(t, policyYAML),
+		Authz:         authz,
+		Clients:       f.clientsOf(t),
+		DelegationTTL: 5 * time.Minute,
+		InstanceAuthz: instance,
+		ApproveTTL:    ttl,
+		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	f.srv = srv
+	return f
+}
+
+// Task 4 wires config.go's approve.ttl_seconds into Options.ApproveTTL
+// (TestLoadConfigReadsTheApproveTTL proves that half); this proves the other
+// half, that a non-default Options.ApproveTTL actually reaches the minted
+// grant — end to end, an operator's ttl_seconds is what a runner sees.
+func TestApproveHonoursANonDefaultApproveTTL(t *testing.T) {
+	const ttl = 300 * time.Second
+	f := newFixtureWithApproveTTL(t, exchangePolicy, newFakeAuthz(), enforced, ttl)
+	bearer := f.employeeToken("jdoe", map[string]any{"garm": approverGarm("RESTRICTED", "financial")})
+
+	resp := f.approve(bearer, f.approveBody("payments.v1.initiate_payment", "customer:C-8123", bankMaterial()))
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("approve failed: status %d, body %s", resp.StatusCode, raw)
+	}
+	var out struct {
+		Grant     string `json:"grant"`
+		ExpiresIn int64  `json:"expires_in"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decoding response: %v; body %s", err, raw)
+	}
+	if out.ExpiresIn != int64(ttl.Seconds()) {
+		t.Errorf("expires_in = %d, want %d", out.ExpiresIn, int64(ttl.Seconds()))
+	}
+
+	claims := f.decodeAndVerify(out.Grant)
+	iat, _ := claims["iat"].(float64)
+	exp, _ := claims["exp"].(float64)
+	if int64(exp-iat) != int64(ttl.Seconds()) {
+		t.Errorf("exp - iat = %d, want %d", int64(exp-iat), int64(ttl.Seconds()))
+	}
+}
+
+// Carried from Task 3's review: a duplicate top-level key is the same class
+// of smuggle DisallowUnknownFields exists to prevent, but it does not catch
+// this one. `{"tool":"a.b","tool":"c.d",...}` is one legal JSON object, so
+// json.Decoder happily decodes it last-wins — the request that is approved
+// is not the one whose fields a reader sees first.
+func TestApproveRefusesADuplicateTopLevelKey(t *testing.T) {
+	f := newFixture(t, exchangePolicy, newFakeAuthz(), enforced)
+	bearer := f.employeeToken("jdoe", map[string]any{"garm": approverGarm("RESTRICTED", "financial")})
+	body := f.approveBody("payments.v1.initiate_payment", "customer:C-8123", bankMaterial())
+
+	materialJSON, err := json.Marshal(body["material"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := fmt.Sprintf(`{"tool":"a.b","tool":"c.d","subject":%q,"material":%s,"client_assertion":%q}`,
+		body["subject"], materialJSON, body["client_assertion"])
+
+	req := httptest.NewRequest(http.MethodPost, "/approve", strings.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	rec := httptest.NewRecorder()
+	f.srv.ApproveHandler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 — a duplicate top-level key must be refused, not decoded last-wins", rec.Code)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"error":"access_denied"}` {
+		t.Fatalf("body = %q, want the single opaque denial", got)
+	}
 }

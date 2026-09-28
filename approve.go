@@ -183,6 +183,20 @@ func (s *Server) approve(r *http.Request) (string, time.Duration, error) {
 		return "", 0, errDenied
 	}
 
+	// A duplicate top-level key is one legal JSON object that
+	// encoding/json's struct decode would happily accept last-wins: the
+	// request approved is not the one whose first occurrence of a field a
+	// reader sees. DisallowUnknownFields does not catch this — every key is
+	// known — so it is checked separately, by token, before the value is
+	// ever decoded into the request struct.
+	if dup, err := hasDuplicateTopLevelKey(body); err != nil {
+		s.denyApprove(ctx, "malformed request body", "err", err)
+		return "", 0, errDenied
+	} else if dup {
+		s.denyApprove(ctx, "request body carries a duplicate top-level key")
+		return "", 0, errDenied
+	}
+
 	var req approveRequest
 	dec := json.NewDecoder(bytes.NewReader(body))
 	// A misspelled key is a request that silently approves something other
@@ -370,4 +384,72 @@ func validToolFQN(s string) error {
 func typePrefixed(s string) bool {
 	i := strings.Index(s, ":")
 	return i > 0 && i < len(s)-1
+}
+
+// hasDuplicateTopLevelKey reports whether data's outermost JSON value is an
+// object carrying the same key twice. It exists because a struct decode
+// (even with DisallowUnknownFields) silently accepts a repeated key
+// last-wins — legal JSON, but a request whose approved fields are not the
+// ones a reader sees first. If data is not a top-level object, this reports
+// no duplicate and leaves the shape refusal to the struct decode that
+// follows.
+func hasDuplicateTopLevelKey(data []byte) (bool, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return false, err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return false, nil
+	}
+	seen := make(map[string]bool)
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return false, err
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return false, fmt.Errorf("expected an object key, got %v", tok)
+		}
+		if seen[key] {
+			return true, nil
+		}
+		seen[key] = true
+		if err := skipJSONValue(dec); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// skipJSONValue consumes exactly one JSON value (whatever its shape) from
+// dec, so hasDuplicateTopLevelKey can walk a top-level object's keys without
+// caring what any of its values look like.
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if _, ok := tok.(json.Delim); !ok {
+		// A scalar (string, number, bool, null) — already fully consumed.
+		return nil
+	}
+	// '{' or '[': consume tokens until its matching close.
+	depth := 1
+	for depth > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+	}
+	return nil
 }

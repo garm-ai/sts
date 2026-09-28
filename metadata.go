@@ -21,10 +21,11 @@ import (
 // and a mismatch is a refusal rather than a mystery.
 //
 // The shape follows RFC 8414 (OAuth 2.0 Authorization Server Metadata) where
-// it has a field for what we mean, which is most of it. `garm_audience` is an
-// extension because RFC 8414 describes what an authorization server IS and has
-// no field for the audience it MINTS — that is peculiar to a service with
-// exactly one downstream, which is peculiar to this one.
+// it has a field for what we mean, which is most of it. `garm_audience` and
+// `garm_approve_endpoint` are extensions because RFC 8414 describes what an
+// authorization server IS and has no field for the audience it MINTS, nor for
+// a second, non-OAuth endpoint this one happens to serve — both are peculiar
+// to a service with exactly one downstream, which is peculiar to this one.
 type Metadata struct {
 	Issuer string `json:"issuer"`
 
@@ -47,6 +48,16 @@ type Metadata struct {
 	// identifier. The field a verifier actually has to agree with, and the one
 	// RFC 8414 has no place for.
 	GarmAudience string `json:"garm_audience"`
+
+	// GarmApproveEndpoint is where a caller obtains an approval grant. Like
+	// GarmAudience it is an extension: RFC 8414 describes what an
+	// authorization server IS and has no field for a second, non-OAuth
+	// endpoint this one happens to serve.
+	//
+	// Advertised rather than assumed for the same reason JWKSURI is: the
+	// runner is configured with one base URL and reads the rest, so the two
+	// sides cannot be told two paths that disagree.
+	GarmApproveEndpoint string `json:"garm_approve_endpoint"`
 }
 
 // MetadataHandler serves the document at
@@ -55,7 +66,7 @@ type Metadata struct {
 // Unauthenticated, and it should be: everything in it is already discoverable
 // by anyone who can obtain one token, and a verifier has to read it before it
 // holds any credential of its own.
-func (s *Server) MetadataHandler(jwksURI, tokenEndpoint string) http.Handler {
+func (s *Server) MetadataHandler(jwksURI, tokenEndpoint, approveEndpoint string) http.Handler {
 	doc := Metadata{
 		Issuer:                    s.issuer,
 		JWKSURI:                   jwksURI,
@@ -63,6 +74,7 @@ func (s *Server) MetadataHandler(jwksURI, tokenEndpoint string) http.Handler {
 		GrantTypesSupported:       []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
 		SigningAlgValuesSupported: []string{"ES256"},
 		GarmAudience:              s.audience,
+		GarmApproveEndpoint:       approveEndpoint,
 	}
 	body, err := json.Marshal(doc)
 	if err != nil {

@@ -15,7 +15,8 @@ import (
 func TestMetadataPublishesWhatAVerifierMustAgreeWith(t *testing.T) {
 	s := &Server{issuer: "https://sts.example", audience: "garm://garmd"}
 	h := s.MetadataHandler("https://sts.example/.well-known/jwks.json",
-		"https://sts.example/token")
+		"https://sts.example/token",
+		"https://sts.example/approve")
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil))
@@ -41,6 +42,14 @@ func TestMetadataPublishesWhatAVerifierMustAgreeWith(t *testing.T) {
 	if got.JWKSURI == "" {
 		t.Error("no jwks_uri")
 	}
+
+	// The approval endpoint. A caller that has to obtain a grant needs to
+	// know where; publishing it means agentd is configured with one base URL
+	// and discovers the rest, rather than being told two paths that can
+	// disagree.
+	if got.GarmApproveEndpoint != "https://sts.example/approve" {
+		t.Errorf("garm_approve_endpoint = %q", got.GarmApproveEndpoint)
+	}
 }
 
 // The wire names, pinned. A verifier in another repository reads these
@@ -49,14 +58,14 @@ func TestMetadataPublishesWhatAVerifierMustAgreeWith(t *testing.T) {
 func TestTheWireNamesAreStable(t *testing.T) {
 	s := &Server{issuer: "i", audience: "a"}
 	rec := httptest.NewRecorder()
-	s.MetadataHandler("j", "t").ServeHTTP(rec,
+	s.MetadataHandler("j", "t", "a").ServeHTTP(rec,
 		httptest.NewRequest(http.MethodGet, "/", nil))
 
 	var raw map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []string{"issuer", "jwks_uri", "garm_audience"} {
+	for _, k := range []string{"issuer", "jwks_uri", "garm_audience", "garm_approve_endpoint"} {
 		if _, ok := raw[k]; !ok {
 			t.Errorf("%q absent; a verifier reading it would compare against an "+
 				"empty string and pass", k)
@@ -69,7 +78,7 @@ func TestTheWireNamesAreStable(t *testing.T) {
 func TestMetadataRefusesAnythingButARead(t *testing.T) {
 	s := &Server{issuer: "i", audience: "a"}
 	rec := httptest.NewRecorder()
-	s.MetadataHandler("j", "t").ServeHTTP(rec,
+	s.MetadataHandler("j", "t", "a").ServeHTTP(rec,
 		httptest.NewRequest(http.MethodPost, "/", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST got %d, want 405", rec.Code)
