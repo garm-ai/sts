@@ -55,6 +55,7 @@ agents:
 // so every test can build exactly the tuple set its scenario needs.
 type fakeAuthz struct {
 	canInvoke map[[2]string]bool
+	canRun    map[[2]string]bool
 	handledBy map[[2]string]bool
 	inSegment map[[2]string]bool
 }
@@ -62,6 +63,7 @@ type fakeAuthz struct {
 func newFakeAuthz() *fakeAuthz {
 	return &fakeAuthz{
 		canInvoke: map[[2]string]bool{},
+		canRun:    map[[2]string]bool{},
 		handledBy: map[[2]string]bool{},
 		inSegment: map[[2]string]bool{},
 	}
@@ -69,6 +71,9 @@ func newFakeAuthz() *fakeAuthz {
 
 func (a *fakeAuthz) allowInvoke(principal, agent string) {
 	a.canInvoke[[2]string{principal, agent}] = true
+}
+func (a *fakeAuthz) allowRun(runner, agent string) {
+	a.canRun[[2]string{runner, agent}] = true
 }
 func (a *fakeAuthz) allowHandledBy(employee, customer string) {
 	a.handledBy[[2]string{employee, customer}] = true
@@ -79,6 +84,9 @@ func (a *fakeAuthz) allowSegment(principal, segment string) {
 
 func (a *fakeAuthz) CanInvoke(_ context.Context, principal, agent string) (bool, error) {
 	return a.canInvoke[[2]string{principal, agent}], nil
+}
+func (a *fakeAuthz) CanRun(_ context.Context, runner, agent string) (bool, error) {
+	return a.canRun[[2]string{runner, agent}], nil
 }
 func (a *fakeAuthz) HandledBy(_ context.Context, employee, customer string) (bool, error) {
 	return a.handledBy[[2]string{employee, customer}], nil

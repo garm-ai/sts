@@ -18,6 +18,13 @@ type canInvokeTuple struct {
 	Agent     string `yaml:"agent"`
 }
 
+// canRunTuple is the on-disk shape of one written can_run fact: which
+// runner may execute which agent.
+type canRunTuple struct {
+	Runner string `yaml:"runner"`
+	Agent  string `yaml:"agent"`
+}
+
 type handledByTuple struct {
 	Employee string `yaml:"employee"`
 	Customer string `yaml:"customer"`
@@ -33,6 +40,7 @@ type inSegmentTuple struct {
 // nothing else.
 type staticFile struct {
 	CanInvoke []canInvokeTuple `yaml:"can_invoke"`
+	CanRun    []canRunTuple    `yaml:"can_run"`
 	HandledBy []handledByTuple `yaml:"handled_by"`
 	InSegment []inSegmentTuple `yaml:"in_segment"`
 }
@@ -45,6 +53,7 @@ type staticFile struct {
 // an error from a lookup, only from LoadStaticAuthorizer itself.
 type staticAuthorizer struct {
 	canInvoke map[[2]string]bool
+	canRun    map[[2]string]bool
 	handledBy map[[2]string]bool
 	inSegment map[[2]string]bool
 }
@@ -71,6 +80,7 @@ func LoadStaticAuthorizer(path string) (Authorizer, error) {
 
 	a := &staticAuthorizer{
 		canInvoke: make(map[[2]string]bool, len(sf.CanInvoke)),
+		canRun:    make(map[[2]string]bool, len(sf.CanRun)),
 		handledBy: make(map[[2]string]bool, len(sf.HandledBy)),
 		inSegment: make(map[[2]string]bool, len(sf.InSegment)),
 	}
@@ -82,6 +92,15 @@ func LoadStaticAuthorizer(path string) (Authorizer, error) {
 			return nil, fmt.Errorf("sts: static authorizer file %s: can_invoke[%d]: missing agent", path, i)
 		}
 		a.canInvoke[[2]string{t.Principal, t.Agent}] = true
+	}
+	for i, t := range sf.CanRun {
+		if t.Runner == "" {
+			return nil, fmt.Errorf("sts: static authorizer file %s: can_run[%d]: missing runner", path, i)
+		}
+		if t.Agent == "" {
+			return nil, fmt.Errorf("sts: static authorizer file %s: can_run[%d]: missing agent", path, i)
+		}
+		a.canRun[[2]string{t.Runner, t.Agent}] = true
 	}
 	for i, t := range sf.HandledBy {
 		if t.Employee == "" {
@@ -106,6 +125,10 @@ func LoadStaticAuthorizer(path string) (Authorizer, error) {
 
 func (a *staticAuthorizer) CanInvoke(_ context.Context, principal, agent string) (bool, error) {
 	return a.canInvoke[[2]string{principal, agent}], nil
+}
+
+func (a *staticAuthorizer) CanRun(_ context.Context, runner, agent string) (bool, error) {
+	return a.canRun[[2]string{runner, agent}], nil
 }
 
 func (a *staticAuthorizer) HandledBy(_ context.Context, employee, customer string) (bool, error) {

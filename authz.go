@@ -2,7 +2,7 @@ package sts
 
 import "context"
 
-// Authorizer answers the three relationship questions the exchange handler
+// Authorizer answers the four relationship questions the exchange handler
 // needs, per spec §3.1. Every method answers a yes/no relationship, never a
 // broader query: the caller names the exact pair it wants resolved.
 //
@@ -28,6 +28,18 @@ import "context"
 type Authorizer interface {
 	// CanInvoke reports whether principal may reach agent at all.
 	CanInvoke(ctx context.Context, principal, agent string) (bool, error)
+
+	// CanRun reports whether runner may EXECUTE agent — a different
+	// question from CanInvoke, which asks whether a principal may reach an
+	// agent at all. The governed door (program plan §3.9) asks both: this
+	// one of the process that would run the agent, and CanInvoke of the
+	// human whose authority it would exercise. Collapsing them would let
+	// any runner execute any agent some customer happened to be entitled
+	// to, which is the opposite of what a runner identity is for.
+	//
+	// runner is type-prefixed as "runner:<id>", where <id> is the client id
+	// the runner AUTHENTICATED as — never a value a caller supplies.
+	CanRun(ctx context.Context, runner, agent string) (bool, error)
 
 	// HandledBy reports whether employee is the one assigned to customer.
 	// It is asked only when an employee is acting on a customer's behalf —

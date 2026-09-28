@@ -297,6 +297,7 @@ func TestBuildRefusesAnUnknownInstanceAuthorizationStatus(t *testing.T) {
 type nullAuthorizer struct{}
 
 func (nullAuthorizer) CanInvoke(context.Context, string, string) (bool, error) { return false, nil }
+func (nullAuthorizer) CanRun(context.Context, string, string) (bool, error)    { return false, nil }
 func (nullAuthorizer) HandledBy(context.Context, string, string) (bool, error) { return false, nil }
 func (nullAuthorizer) InSegment(context.Context, string, string) (bool, error) { return false, nil }
 
