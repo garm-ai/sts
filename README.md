@@ -15,9 +15,13 @@ which the verifying daemon (`garmd`) uses to decide what the agent may do.
   may execute this agent at all, and the minted token records which runner
   obtained it in a top-level `exec` claim.
 
+It also mints a second, different credential: a **grant**, the record of a
+human's approval of one specific call (`POST /approve`, below). A delegation
+token is a session; a grant is a decision.
+
 This is not a general-purpose STS. There are two exchanges, one claim shape,
-one minting path shared by both doors, and one authorization port. What
-follows describes exactly what exists.
+one minting path shared by both doors, one approval endpoint, and one
+authorization port. What follows describes exactly what exists.
 
 ## What this service does
 
@@ -81,7 +85,7 @@ identity when an asserted one was asked for, or the reverse.
 | Field | Value |
 |---|---|
 | `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` |
-| `client_assertion_type` | `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` |
+| `client_assertion_type` | `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` — **optional**, but a *different* value is refused rather than ignored (`private_key_jwt` is the only client authentication this service implements, so an absent type is unambiguous; a present one naming something else means the caller and this endpoint have already diverged) |
 | `client_assertion` | the runner's `private_key_jwt`, exactly as the direct door |
 | `on_behalf_of` | type-prefixed subject, e.g. `employee:jdoe` — **required**, and its prefix must be `customer:` or `employee:` |
 | `subject_kind` | `USER` (`SERVICE` is refused: it has no claims-policy path in this version) |
@@ -157,12 +161,135 @@ the governed door's:
   this service *does* refuse to mint is a chain whose verb intersection is
   empty (a token that would be syntactically valid and useless).
 
+## `POST /approve` — minting a human's yes
+
+A second endpoint, and a different credential. `POST /token` mints a
+**delegation token**: a session, saying *this agent may act for this
+person*. `POST /approve` mints a **grant**: a decision, saying *this person
+approved this specific call, over these specific values*. `garmd` requires
+one before it will run a tool that declares it needs human approval.
+
+`POST /approve`, `application/json`, plus the approver's own IdP token in
+`Authorization: Bearer <token>`:
+
+| Field | Value |
+|---|---|
+| `client_assertion` | the calling service's `private_key_jwt` — the same registry, the same replay protection, as `POST /token` |
+| `client_assertion_type` | optional; if present it must be `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` |
+| `tool` | the tool's FQN, e.g. `payments.v1.initiate_payment` — shape-checked only, since this service holds no catalogue |
+| `subject` | whose call was approved, type-prefixed, e.g. `customer:C-8123` |
+| `material` | a flat map of dotted path → the value's canonical **text** form: the values the human actually saw |
+
+The assertion is in the **body**, not a header: RFC 7523 puts it in the
+request itself, and a new header would add a name to the cross-repository
+header table that nothing else there needs. An unknown JSON field is
+refused, not dropped — a misspelled key is a request that silently approves
+something other than what the caller meant.
+
+Response:
+
+```json
+{ "grant": "<jws>", "expires_in": 900 }
+```
+
+The grant itself:
+
+```json
+{
+  "iss": "https://sts.internal.example.com",
+  "aud": "garm://garmd",
+  "jti": "kQ7m...",
+  "iat": 1780000000,
+  "exp": 1780000900,
+  "garm_grant": {
+    "tool": "payments.v1.initiate_payment",
+    "subject": "customer:C-8123",
+    "material": "sha256:...",
+    "approver": "employee:jdoe",
+    "approver_clearance": "RESTRICTED",
+    "approver_compartments": ["financial"]
+  }
+}
+```
+
+- **There is no `act` key, and the minted struct has no field that could
+  produce one.** A delegated identity may not approve — otherwise an agent
+  could approve the destructive action it is itself about to take. An
+  approver token carrying an `act` claim is refused outright (the *key*,
+  not its value: a null `act` is still a token that claimed a chain), and
+  `garmd` refuses a grant that carries one. Both ends enforce it, because
+  the rule's purpose is to survive a dishonest issuer, and either end alone
+  only survives an honest one.
+- **The approver must be `employee` kind**, decided by `TrustedIssuer.Kind`
+  — per-issuer configuration, never sniffed from the token, exactly as on
+  the direct door. A customer cannot approve a payment.
+- **`approver` is built by the same `identityForKind` the direct door uses**,
+  so a persona token already carrying `employee:jdoe` does not become
+  `employee:employee:jdoe`, and a subject whose prefix contradicts its
+  issuer's kind is refused rather than repaired.
+- **`material` is a digest, computed by `grant.Digest` from
+  `github.com/garm-ai/garm/contracts/grant`** — the *same function* `garmd`
+  recomputes it with, a module dependency rather than a second
+  implementation. Two independent derivations of one string is a divergence
+  waiting to happen: if the sides ever disagree byte for byte, every
+  approval is refused or — worse — one matches a request the approver never
+  saw, and neither side can detect that alone. This service digests what it
+  is **given** and never resolves a path itself, which is why it needs no
+  descriptors and no catalogue; a caller lying about the values is not a
+  hole, because `garmd` re-extracts from the real request and compares.
+- **`approver_clearance` and `approver_compartments` are *recorded*, not
+  judged.** They are read off the approver's own verified token's `garm`
+  claim (both spellings — `RESTRICTED` and `CLEARANCE_RESTRICTED` — are
+  accepted, and compartments are sorted so one approver's identical
+  decision never mints two different grants). Whether that authority meets
+  what the tool requires is `garmd`'s question: it has the catalogue, this
+  service does not. An approver whose token asserts *no* usable authority
+  is refused here, though — a grant recording none is one `garmd` rejects
+  with a message about an under-cleared approver, which sends an operator
+  looking at the wrong system.
+- **There is no `approved_at`.** A separate approval timestamp would be a
+  mechanism to re-mint an old decision with a fresh expiry, and `iat` is
+  what `garmd` measures a grant's age from against the tool's
+  `max_grant_age_seconds`. That limit is a ceiling this service cannot
+  raise: `Options.ApproveTTL` (default 15 minutes) only bounds the grant's
+  own `exp`, so a tool asking for five minutes gets five however generous
+  the default is.
+- **Every refusal is the same opaque `400 {"error":"access_denied"}`** that
+  `POST /token` returns, with the reason on the log and never in the
+  response — otherwise this endpoint is an enumeration oracle for which
+  tools exist and who may approve them. The one exception is a wrong HTTP
+  method, which is `405` with an `Allow` header: it names no tool and no
+  approver, and answering `400` to a `GET` would make the endpoint harder
+  to operate for nothing.
+
 ## What is NOT built
 
 - **The runner itself / the agent-runner broker** is not part of this
   service. This service mints *for* a runner (the governed door above); it
   does not execute agents, and it has no view of whether a run happened.
 - **The NATS auth callout integration** is not part of this service.
+- **`/approve` is not mounted yet.** The handler exists
+  (`(*Server).ApproveHandler()`, `approve.go`) and is fully tested, but
+  `cmd/sts/main.go` still serves only `/token`, the JWKS and the metadata
+  document, and `Config` has no `approveTTL` key — so a deployed binary
+  answers `404` on `/approve` and `Options.ApproveTTL` can only be set by a
+  caller constructing `Options` directly. Mounting it and wiring the TTL
+  through configuration is the next step.
+- **Deciding whether an approver is allowed to approve.** This service
+  *attests* — it records who approved and what authority their own token
+  asserted — and `garmd` *decides*, because the catalogue is what knows
+  a tool's `approver_min_clearance`, its required compartments, and its
+  `max_grant_age_seconds`. An approver whose clearance does not meet a
+  tool's bar receives a grant that `garmd` then refuses: a poor experience,
+  deliberately, and not a hole.
+- **Single-use enforcement of a grant's `jti`.** Every grant carries a fresh
+  one, and spending it at most once is `garmd`'s side of the contract; this
+  service keeps no record of the grants it has minted.
+- **Any notion of what a tool is.** `/approve` checks that `tool` has the
+  shape of an FQN (`pkg.name`, never a `/pkg.Service/Method` route, which
+  would match nothing on the far side) and nothing more. Whether it exists,
+  whether it requires approval at all, and which of its fields are material
+  are all questions for the catalogue this service does not hold.
 - **A second `Authorizer` implementation beyond these two.** There are
   two, and which one a binary has is fixed when it is built, not at
   runtime. An **untagged** build uses `LoadStaticAuthorizer`
@@ -319,6 +446,7 @@ timeout for in-flight requests to finish.
 | `authz_openfga.go` | The OpenFGA-backed `Authorizer` (production; `-tags openfga`) |
 | `clients.go` | `private_key_jwt` client authentication + replay protection |
 | `exchange.go` | The `POST /token` handler: both doors, in order, and the one minting path they share |
+| `approve.go` | The `POST /approve` handler: mints the grant that records a human's yes |
 | `config.go` | Loads and validates `deploy/config.yaml`'s shape, wires a `Server` |
 | `cmd/sts/main.go` | The binary: flags, logging, TLS, graceful shutdown |
 | `cmd/sts/authz_static.go`, `cmd/sts/authz_openfga.go` | Which `Authorizer` this build gets — mutually exclusive build tags |

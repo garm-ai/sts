@@ -53,8 +53,11 @@ fi
 description = "Install the garm CLI at the pinned version"
 # Pinned, not @latest, for the same reason examples pins it: the vocabulary
 # a claims policy is checked against must not shift because someone upgraded
-# a CLI on a laptop. garm is a BINARY here — sts takes no module dependency
-# on garm-ai/garm.
+# a CLI on a laptop. The CLI is a BINARY here, installed rather than
+# imported — separate from the module dependency approve.go takes on
+# github.com/garm-ai/garm/contracts/grant, which exists so the digest a
+# grant carries and the digest garmd recomputes are one function and not
+# two implementations (approval-grants design, "Decided" item 4).
 #
 # v0.12.0, not the latest real tag (v0.11.0): `claims check` — what the
 # claims-check task below needs — landed after v0.11.0. v0.12.0 does not

@@ -1075,6 +1075,74 @@ func TestExchange2RefusesWhenSubjectTokenIsAlsoPresent(t *testing.T) {
 	}
 }
 
+// The same refusal, against a caller who REPEATS a door field to hide it.
+//
+// url.Values.Encode emits every value, and r.FormValue reads only the
+// first — so "subject_token=&subject_token=<real>" presents an empty
+// subject_token to the door guard and a real one to whatever reads the form
+// afterwards. The guard must examine every value, the way a presented `act`
+// already does, or the both-present refusal is decorative.
+func TestExchangeRefusesBothDoorsEvenWhenAFieldIsRepeated(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+
+	cases := map[string]func(f *fixture) url.Values{
+		"subject_token hidden behind a leading blank": func(f *fixture) url.Values {
+			form := f.form2("employee:jdoe", "USER", "order-assistant", "acme")
+			form["subject_token"] = []string{"", f.employeeToken("jdoe", nil)}
+			return form
+		},
+		"on_behalf_of hidden behind a leading blank": func(f *fixture) url.Values {
+			form := f.form(f.employeeToken("jdoe", nil), "", "order-assistant")
+			form["on_behalf_of"] = []string{"", "employee:jdoe"}
+			form.Set("subject_kind", "USER")
+			form.Set("tenant", "acme")
+			return form
+		},
+	}
+
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, exchangePolicy, authz, enforced)
+			if resp := f.do(build(f)); resp.StatusCode == http.StatusOK {
+				t.Fatal("minted a token for a request that named both doors; repeating a field must not slip past the both-present refusal")
+			}
+		})
+	}
+}
+
+// client_assertion_type is in the governed door's documented request table,
+// so it must MEAN something. Optional (private_key_jwt is the only client
+// authentication this service implements, so an absent type is
+// unambiguous), but a present one naming a different kind of assertion is
+// refused rather than accepted and disregarded.
+func TestExchangeChecksTheClientAssertionType(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+
+	t.Run("the jwt-bearer urn is accepted", func(t *testing.T) {
+		f := newFixture(t, exchangePolicy, authz, enforced)
+		form := f.form2("employee:jdoe", "USER", "order-assistant", "acme")
+		form.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+		if resp := f.do(form); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 — the documented assertion type must be accepted", resp.StatusCode)
+		}
+	})
+
+	t.Run("any other assertion type is refused", func(t *testing.T) {
+		f := newFixture(t, exchangePolicy, authz, enforced)
+		form := f.form2("employee:jdoe", "USER", "order-assistant", "acme")
+		form.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:saml2-bearer")
+		if resp := f.do(form); resp.StatusCode == http.StatusOK {
+			t.Fatal("minted a token for a caller that said it was presenting a SAML assertion; a documented field that is never read is a field a caller is entitled to believe in")
+		}
+	})
+}
+
 // Review Focus 4. on_behalf_of is asserted, not verified, so its SHAPE is
 // the only thing this service can check about it. A bare "jdoe" builds an
 // identity no tuple matches, which would read back as an ordinary denial and

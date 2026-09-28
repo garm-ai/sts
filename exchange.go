@@ -24,6 +24,17 @@ import (
 // grantTypeTokenExchange is the only grant_type this endpoint accepts.
 const grantTypeTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange"
 
+// clientAssertionTypeJWTBearer is the only `client_assertion_type` this
+// service accepts, at either endpoint (RFC 7523 §2.2). The field itself is
+// OPTIONAL — private_key_jwt is the only client authentication this service
+// implements, so an absent type is unambiguous — but a present one that
+// names something else is refused rather than ignored: a caller that
+// believes it is presenting a different kind of assertion has already
+// diverged from what this endpoint will do with it, and silently accepting
+// the field while disregarding its value is how that divergence survives to
+// production.
+const clientAssertionTypeJWTBearer = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+
 // issuedTokenType is the `issued_token_type` this endpoint always reports:
 // every minted token is a JWT.
 const issuedTokenType = "urn:ietf:params:oauth:token-type:jwt"
@@ -31,11 +42,13 @@ const issuedTokenType = "urn:ietf:params:oauth:token-type:jwt"
 // defaultDelegationTTL is used when Options.DelegationTTL is left zero.
 const defaultDelegationTTL = 10 * time.Minute
 
-// deniedBody is THE single response body for every denial this handler can
-// produce, whatever the reason. An unknown agent, a missing handled_by
-// relation, an under-privileged caller and a malformed request all look
-// identical to the caller: distinguishing them would make this endpoint an
-// enumeration oracle. The reason always goes to the log, never the response.
+// deniedBody is THE single response body for every denial this SERVICE can
+// produce, from either endpoint, whatever the reason. An unknown agent, a
+// missing handled_by relation, an under-privileged caller, a malformed
+// request and an approver who is not an employee all look identical to the
+// caller: distinguishing them would make these endpoints an enumeration
+// oracle for which tools exist and who may approve them. The reason always
+// goes to the log, never the response.
 const deniedBody = `{"error":"access_denied"}`
 
 // InstanceAuthzConfig is the required assertion about whether the tool plane
@@ -80,6 +93,17 @@ type Options struct {
 	// minutes if zero or negative.
 	DelegationTTL time.Duration
 
+	// ApproveTTL bounds how long a minted GRANT is valid. Defaults to 15
+	// minutes if zero or negative.
+	//
+	// Separate from DelegationTTL because they bound different things: a
+	// delegation token is a session and an approval is a decision. And it is
+	// only ever a floor on staleness, never a ceiling — the tool's own
+	// max_grant_age_seconds is a limit this cannot raise (approval-grants
+	// §2.3), so a tool asking for five minutes gets five whatever is set
+	// here.
+	ApproveTTL time.Duration
+
 	InstanceAuthz InstanceAuthzConfig
 
 	// Log receives every denial reason and every instance-authorization cap.
@@ -97,6 +121,11 @@ type Server struct {
 	authz    Authorizer
 	clients  *ClientRegistry
 	ttl      time.Duration
+
+	// approveTTL is the grant TTL, separate from ttl for the reason
+	// Options.ApproveTTL gives.
+	approveTTL time.Duration
+
 	instance InstanceAuthzConfig
 	log      *slog.Logger
 }
@@ -148,22 +177,28 @@ func NewServer(opts Options) (*Server, error) {
 		ttl = defaultDelegationTTL
 	}
 
+	approveTTL := opts.ApproveTTL
+	if approveTTL <= 0 {
+		approveTTL = defaultApproveTTL
+	}
+
 	log := opts.Log
 	if log == nil {
 		log = slog.Default()
 	}
 
 	return &Server{
-		issuer:   opts.Issuer,
-		audience: opts.Audience,
-		keyring:  opts.Keyring,
-		verifier: opts.Verifier,
-		policy:   opts.Policy,
-		authz:    opts.Authz,
-		clients:  opts.Clients,
-		ttl:      ttl,
-		instance: opts.InstanceAuthz,
-		log:      log,
+		issuer:     opts.Issuer,
+		audience:   opts.Audience,
+		keyring:    opts.Keyring,
+		verifier:   opts.Verifier,
+		policy:     opts.Policy,
+		authz:      opts.Authz,
+		clients:    opts.Clients,
+		ttl:        ttl,
+		approveTTL: approveTTL,
+		instance:   opts.InstanceAuthz,
+		log:        log,
 	}, nil
 }
 
@@ -269,8 +304,24 @@ func (s *Server) serveToken(w http.ResponseWriter, r *http.Request) {
 	// exchange 2 (program plan §3.9: "subject_token must be absent — its
 	// presence selects exchange 1"). Both present is ambiguous, and picking
 	// one would mint a token the caller did not ask for, so it refuses.
-	subjectToken := r.FormValue("subject_token")
-	onBehalfOf := r.FormValue("on_behalf_of")
+	//
+	// Read through firstNonEmpty, not FormValue: FormValue returns only the
+	// FIRST value of a repeated field, so "subject_token=&subject_token=
+	// <real>&on_behalf_of=<real>" would present an empty subject_token to
+	// this guard and a real one to exchange 1 — a request carrying both
+	// doors' fields that the both-present refusal below never sees. Every
+	// value is examined, the same way a presented `act` is.
+	subjectToken, _ := firstNonEmpty(r.Form["subject_token"])
+	onBehalfOf, _ := firstNonEmpty(r.Form["on_behalf_of"])
+
+	// RFC 7523 §2.2's assertion type, checked before either door is chosen
+	// so both answer it identically. Optional; wrong is refused.
+	if t, ok := firstNonEmpty(r.Form["client_assertion_type"]); ok && t != clientAssertionTypeJWTBearer {
+		s.deny(r.Context(), "client_assertion_type names an assertion kind this service does not accept",
+			"client_assertion_type", t)
+		s.writeDenied(w)
+		return
+	}
 
 	var (
 		tok string
