@@ -59,11 +59,11 @@ description = "Install the garm CLI at the pinned version"
 # grant carries and the digest garmd recomputes are one function and not
 # two implementations (approval-grants design, "Decided" item 4).
 #
-# v0.14.1: the first tag whose `claims check` and `catalogue build` read the
+# v0.14.2: the first tag whose `claims check` and `catalogue build` read the
 # bank example as it is laid out today (agent manifests, material fields).
 # Pinned, not latest, so a garm release cannot turn this repository's CI red
 # on its own; bump it deliberately when the bank example moves.
-run = "go install github.com/garm-ai/garm/cmd/garm@v0.14.1"
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.14.2"
 
 [tasks."claims-check"]
 description = "Assert deploy/claims.yaml only references what the bank catalogue declares"
