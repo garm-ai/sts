@@ -362,6 +362,22 @@ func TestLoadConfigReadsTheApproveTTL(t *testing.T) {
 			t.Fatal("LoadConfig accepted a negative approve.ttl_seconds; a grant that expires before it is minted is a startup failure, not a per-request mystery")
 		}
 	})
+
+	// README's Configuration section says "omitted (or 0)" — this is the
+	// "or 0" half: an explicit `ttl_seconds: 0` must behave identically to
+	// the key being absent entirely (the previous subtest), not be read as
+	// a literal zero-second TTL.
+	t.Run("an explicit zero is also the default, not a zero-second TTL", func(t *testing.T) {
+		yaml := strings.Replace(baseConfigYAML(dir, "STS_TEST_KEY_APPROVE"), "ttl_seconds: 900", "ttl_seconds: 0", 1)
+		path := writeFile(t, dir, "config-zero-approve.yaml", yaml)
+		cfg, err := sts.LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.ApproveTTL != 0 {
+			t.Errorf("ApproveTTL = %v, want 0 when ttl_seconds is explicitly 0", cfg.ApproveTTL)
+		}
+	})
 }
 
 // The shipped example must load and must register the runner whose client

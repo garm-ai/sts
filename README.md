@@ -357,11 +357,18 @@ mysterious failure discovered at the first request:
   share an `iss`: the verifier keys on it, so a duplicate would silently
   keep only the last entry's `kind` — and `kind` decides whether
   `instanceAuthorization`'s clearance cap applies.
-- `clients[]` — at least one BFF allowed to authenticate with
-  `private_key_jwt`. Client keys are *public* keys, not secrets, so they
-  may be a file path or inlined PEM directly. A config with no clients
-  would serve a JWKS and deny every `POST /token` as an unknown client, so
-  an empty list is a startup failure.
+- `clients[]` — at least one service allowed to authenticate with
+  `private_key_jwt` to **both** `POST /token` and `POST /approve` — a BFF,
+  and/or the agent runner (`deploy/config.yaml` registers `agentd`, the
+  runner, alongside `shop-bff`, the BFF). Client keys are *public* keys,
+  not secrets, so they may be a file path or inlined PEM directly. A
+  client's id matters beyond authentication: it is what makes the
+  `runner:<id>` identity the governed door's `CanRun` is asked about
+  (`"runner:" + the AUTHENTICATED client id`, never a field a caller
+  supplies — see `deploy/tuples.yaml`'s `can_run` tuple). A config with no
+  clients would serve a JWKS and deny every `POST /token` and
+  `POST /approve` as an unknown client, so an empty list is a startup
+  failure.
 - `policy` — path to the claims policy file (`LoadPolicy`, `claims.go`).
 - `authz.static` — path to the static authorizer tuples file
   (`LoadStaticAuthorizer`, `authz_static.go`). Used by an **untagged**
@@ -395,6 +402,11 @@ static when untagged, OpenFGA under `-tags openfga` — in
 
 ## Running it
 
+Once started, `cmd/sts/main.go` serves four routes: `POST /token` (both
+exchanges), `POST /approve` (the grant-minting endpoint), the JWKS at
+`/.well-known/jwks.json`, and the metadata document at
+`/.well-known/oauth-authorization-server`.
+
 ```bash
 # The dev/CI binary: the flat, file-backed authorizer (deploy/tuples.yaml).
 go build ./cmd/sts
@@ -405,9 +417,10 @@ go build ./cmd/sts
 # refuses to start without them.
 go build -tags openfga ./cmd/sts
 
-# Generate an ES256 signing key and a BFF client keypair. Both must be
-# ECDSA (or RSA) — EdDSA is deliberately excluded from every algorithm
-# allowlist this service accepts, in both directions.
+# Generate an ES256 signing key and a client keypair per registered
+# service (shop-bff, agentd). All of them must be ECDSA (or RSA) — EdDSA
+# is deliberately excluded from every algorithm allowlist this service
+# accepts, in both directions.
 ./deploy/keygen.sh
 export STS_SIGN_KEY_K1="$(cat sts-sign-k1.pem)"
 
@@ -455,7 +468,7 @@ timeout for in-flight requests to finish.
 | `deploy/config.yaml` | A complete, loadable example configuration |
 | `deploy/claims.yaml` | An example claims policy |
 | `deploy/tuples.yaml` | An example static-authorizer tuple file |
-| `deploy/keygen.sh` | Generates a signing key and a BFF client keypair |
+| `deploy/keygen.sh` | Generates a signing key and a client keypair per registered service (shop-bff, agentd) |
 | `deploy/model.fga` | The OpenFGA authorization model backing the four `Authorizer` checks |
 | `deploy/tuples.openfga.yaml` | The same example facts as `deploy/tuples.yaml`, in OpenFGA's derived encoding |
 
