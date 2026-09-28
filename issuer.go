@@ -261,7 +261,17 @@ func (v *Verifier) checkRegistered(c *UpstreamClaims, trusted *TrustedIssuer) er
 // parseUpstreamClaims decodes the registered claims this package understands
 // out of an already-verified claim map, keeping the map itself as Raw.
 func parseUpstreamClaims(raw map[string]any) (*UpstreamClaims, error) {
-	sub, _ := raw["sub"].(string)
+	// sub is required, not merely read. Every identity this service asks
+	// the Authorizer about, and every `sub` it mints, is built as
+	// callerKind + ":" + Subject (see exchange.go) — so a token with no
+	// sub, or a sub that is not a string, yields the identity "customer:"
+	// and proceeds. That fails closed today only because every authorizer
+	// lookup for it happens to miss, which is a property of the data in a
+	// store, not a check. Refuse it here, where iss and exp are refused.
+	sub, ok := raw["sub"].(string)
+	if !ok || sub == "" {
+		return nil, fmt.Errorf("token has no sub")
+	}
 	iss, _ := raw["iss"].(string)
 	if iss == "" {
 		return nil, fmt.Errorf("token has no iss")

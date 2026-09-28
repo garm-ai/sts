@@ -379,6 +379,46 @@ func TestVerifyRejectsATokenWithNoExpiry(t *testing.T) {
 	}
 }
 
+// TestVerifyRejectsATokenWithNoUsableSubject covers the claim the whole
+// chain keys on. exchange.go builds every identity it asks the Authorizer
+// about, and the `sub` it mints, as callerKind + ":" + Subject — so an
+// absent or non-string sub produces the identity "customer:" and proceeds.
+// That denies today only because no authorizer lookup happens to match it,
+// which is a fact about the data in a store, not a check in this service.
+func TestVerifyRejectsATokenWithNoUsableSubject(t *testing.T) {
+	now := time.Now()
+	key := genUpstreamKey(t)
+	idp := newTestIdP(t, upstreamJWK("k1", key))
+	trusted := sts.TrustedIssuer{
+		Issuer: "https://idp.example", JWKSURL: idp.server.URL,
+		Audience: []string{"sts"}, Kind: "customer",
+	}
+
+	for name, sub := range map[string]any{
+		"absent":     nil, // no "sub" key at all
+		"empty":      "",
+		"not.string": 42.0, // a numeric sub, which a bare type assertion drops to ""
+	} {
+		t.Run(name, func(t *testing.T) {
+			v := sts.NewVerifier([]sts.TrustedIssuer{trusted}, sts.VerifierOptions{Now: func() time.Time { return now }})
+			claims := map[string]any{
+				"iss": trusted.Issuer,
+				"aud": "sts",
+				"iat": now.Unix(),
+				"exp": now.Add(time.Hour).Unix(),
+			}
+			if sub != nil {
+				claims["sub"] = sub
+			}
+			tok := signUpstreamToken(t, key, jose.ES256, "k1", claims)
+
+			if _, _, err := v.Verify(context.Background(), tok); err == nil {
+				t.Fatalf("Verify() accepted a token whose sub is %s; every identity downstream is built from it", name)
+			}
+		})
+	}
+}
+
 func TestVerifyTolerationOfAudAsStringAndArray(t *testing.T) {
 	now := time.Now()
 	key := genUpstreamKey(t)
