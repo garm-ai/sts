@@ -15,6 +15,18 @@
   relation: member
   object: segment:retail-vip
 
+# The employee side of the same derivation. Both halves are needed for the
+# delegating path (an employee acting for a customer they handle): exchange.go
+# asks can_invoke TWICE there, once for the customer and once for the
+# employee, and the employee's own claim is resolved from their own segment.
+# Without these two tuples the handled_by tuple below can never be exercised.
+- user: segment:support-staff#member
+  relation: invokable_by
+  object: agent:order-assistant
+- user: employee:jdoe
+  relation: member
+  object: segment:support-staff
+
 # handled_by: employee:jdoe is the one assigned to customer:C.
 - user: employee:jdoe
   relation: handled_by

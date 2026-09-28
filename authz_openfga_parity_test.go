@@ -123,7 +123,11 @@ type parityCase struct {
 // retail-vip — a flat, pre-resolved tuple on the static side, but a
 // two-hop derivation (member -> invokable_by -> can_invoke) on the OpenFGA
 // side. That difference in modelling the same fact is exactly what this
-// test exists to keep from drifting apart.
+// test exists to keep from drifting apart. It also covers the delegating
+// path's own facts — the employee's separate can_invoke and their own
+// segment membership — because the two files previously agreed on "no" for
+// both, which is precisely the agreement this test cannot distinguish from
+// correctness on its own.
 var parityScenarios = []parityCase{
 	{
 		name:     "customer can invoke the agent they're entitled to only via segment membership",
@@ -133,9 +137,21 @@ var parityScenarios = []parityCase{
 		expected: true,
 	},
 	{
-		name:     "an employee with no entitlement cannot invoke the agent",
+		// The delegating path's second can_invoke. exchange.go asks the
+		// question twice when an employee acts for a customer, and the
+		// employee's own entitlement is a different fact from the
+		// customer's — on the OpenFGA side derived through a different
+		// segment (support-staff, not retail-vip) entirely.
+		name:     "the delegating employee can invoke the agent via their own segment",
 		method:   "CanInvoke",
 		subject:  "employee:jdoe",
+		object:   "agent:order-assistant",
+		expected: true,
+	},
+	{
+		name:     "an employee in no segment cannot invoke the agent",
+		method:   "CanInvoke",
+		subject:  "employee:ghost",
 		object:   "agent:order-assistant",
 		expected: false,
 	},
@@ -166,6 +182,13 @@ var parityScenarios = []parityCase{
 		subject:  "customer:C",
 		object:   "sme-basic",
 		expected: false,
+	},
+	{
+		name:     "the delegating employee is a member of their own segment",
+		method:   "InSegment",
+		subject:  "employee:jdoe",
+		object:   "support-staff",
+		expected: true,
 	},
 	{
 		name:     "a completely unknown principal is in no segment",
