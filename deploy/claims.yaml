@@ -6,11 +6,22 @@
 # A role is a bundle of claims. Same meaning as devkit's roles: block.
 # Clearance is written in the bare spelling (INTERNAL, not CLEARANCE_INTERNAL)
 # — garmd accepts both, and the bare form is what a human writes here.
+#
+# Compartments and tool sets here are named exactly as the catalogue this
+# policy is checked against declares them (bank's, from garm-ai/examples —
+# see mise.toml's claims-check task). `garm claims check` is the gate that
+# keeps the two from drifting; run it after any edit here.
 roles:
-  support-desk:  { clearance: INTERNAL,     compartments: [support],                verbs: [READ] }
-  payments-desk: { clearance: RESTRICTED,   compartments: [financial],              verbs: [READ, WRITE] }
-  self-service:  { clearance: CONFIDENTIAL, compartments: [pii-contact, financial], verbs: [READ],
-                   tool_sets: [self-service] }
+  # `support` is a declared TOOL SET, not a compartment — what scopes this
+  # role to first-line support tooling belongs in tool_sets, and pii-contact
+  # is the need-to-know a support desk actually has.
+  support-desk:  { clearance: INTERNAL,     compartments: [pii-contact],            verbs: [READ],        tool_sets: [support] }
+  payments-desk: { clearance: RESTRICTED,   compartments: [financial],              verbs: [READ, WRITE], tool_sets: [payments] }
+  # Deliberately no tool_sets: the catalogue declares no self-service set, so
+  # a customer's own token reaches whatever it exposes at this ceiling
+  # rather than a narrower slice that does not exist. See examples/bank's
+  # retail-customer role for the same gap, documented there.
+  self-service:  { clearance: CONFIDENTIAL, compartments: [pii-contact, financial], verbs: [READ] }
 
 # Which segment grants which roles. Membership itself comes from OpenFGA.
 # A principal holding roles from more than one segment gets the UNION: the

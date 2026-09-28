@@ -1,6 +1,6 @@
 # CI for sts.
 #
-# Two jobs. The first is the ordinary one — and it runs everything twice,
+# Three jobs. The first is the ordinary one — and it runs everything twice,
 # once per build tag set, because exactly one of cmd/sts/authz_static.go and
 # cmd/sts/authz_openfga.go is compiled into any given binary and the
 # production one is the tagged build. An untagged green run proves nothing
@@ -106,3 +106,33 @@ jobs:
             fi
           done
           echo "clean: no garmd and no devkit in the dependency graph, untagged or under -tags openfga"
+
+  # deploy/claims.yaml is a shipped example, and a compartment or tool set it
+  # names that the bank catalogue does not declare is not an error anywhere
+  # else — the verifying daemon drops an unknown compartment rather than
+  # refusing the token. sts owns no catalogue of its own, so the bank one is
+  # built fresh here from a checkout of garm-ai/examples (public) — never
+  # read from a committed or downloaded artifact, since that catalogue is
+  # gitignored and generated in examples and a stale copy would make this
+  # check authoritative about the wrong vocabulary.
+  claims:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: checkout examples (public; source of the bank catalogue)
+        uses: actions/checkout@v5
+        with:
+          # No token: — garm-ai/examples is public, and this matches garmd's
+          # own public-repo checkout. `token: ''` is not "no credential":
+          # actions/checkout still writes an Authorization header, carrying an
+          # empty one.
+          repository: garm-ai/examples
+          path: upstream-examples
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+      - name: deploy/claims.yaml against a freshly built bank catalogue
+        env:
+          EXAMPLES_DIR: upstream-examples
+        run: mise run claims-check

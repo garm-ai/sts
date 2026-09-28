@@ -49,6 +49,43 @@ if [ -n "$out" ]; then
 fi
 """
 
+[tasks.cli]
+description = "Install the garm CLI at the pinned version"
+# Pinned, not @latest, for the same reason examples pins it: the vocabulary
+# a claims policy is checked against must not shift because someone upgraded
+# a CLI on a laptop. garm is a BINARY here — sts takes no module dependency
+# on garm-ai/garm.
+#
+# v0.12.0, not the latest real tag (v0.11.0): `claims check` — what the
+# claims-check task below needs — landed after v0.11.0. v0.12.0 does not
+# exist yet; until a release containing `claims check` is tagged, this
+# install step fails with a module-not-found error naming v0.12.0, which is
+# the honest failure — a release is missing, not "unknown command" as if the
+# wiring below were broken.
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.12.0"
+
+[tasks."claims-check"]
+description = "Assert deploy/claims.yaml only references what the bank catalogue declares"
+depends = ["cli"]
+# sts owns no catalogue of its own. deploy/claims.yaml is checked against
+# bank's, from garm-ai/examples (public) — EXAMPLES_DIR points at a checkout
+# of it. CI checks one out fresh on every run; locally it defaults to a
+# sibling checkout, which is how these repositories are conventionally
+# cloned.
+#
+# The catalogue is BUILT here, from that checkout's proto, every run — never
+# read from a bank.binpb on disk. That artifact is gitignored and generated
+# in examples, so a copy lying around anywhere is only ever a stale guess at
+# the real vocabulary.
+run = """
+set -e
+EXAMPLES_DIR="${EXAMPLES_DIR:-../examples}"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+garm catalogue build --proto "$EXAMPLES_DIR/bank/proto" -o "$WORK/bank.binpb" --source garm-ai/examples/bank
+garm claims check deploy/claims.yaml --against "$WORK/bank.binpb"
+"""
+
 [tasks.ci]
 description = "Everything CI runs"
-depends = ["fmt-check", "lint", "build", "test"]
+depends = ["fmt-check", "lint", "build", "test", "claims-check"]
