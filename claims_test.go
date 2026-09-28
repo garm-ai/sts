@@ -213,6 +213,30 @@ segments:
 	}
 }
 
+// TestLoadPolicyRejectsUnknownFieldInRole guards against exactly the gap
+// that let deploy/claims.yaml ship broken: a typo'd key inside `roles:` (say
+// `compartment:`, singular) that a permissive decoder silently drops. A
+// dropped field is never referenced anywhere afterward, so `garm claims
+// check` cannot flag it as unmatched either — the role loads looking
+// intentional, holding fewer claims than whoever wrote it meant to grant.
+// KnownFields(true) turns that into a load-time error instead, matching
+// devkit's LoadPersonas.
+func TestLoadPolicyRejectsUnknownFieldInRole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claims.yaml")
+	yamlContent := `
+roles:
+  r1: { clearance: PUBLIC, compartment: [oops], verbs: [READ] }
+segments:
+  s1: { kind: customer, roles: [r1] }
+`
+	if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sts.LoadPolicy(path); err == nil {
+		t.Fatal("LoadPolicy accepted a role with an unknown field (compartment, singular); a typo'd key is a misconfigured identity, not a warning")
+	}
+}
+
 func TestAgentClaimKindIsAgent(t *testing.T) {
 	// ForAgent produces kind AGENT; ForSegments produces kind USER.
 	p := loadPolicy(t, minimalPolicy)
