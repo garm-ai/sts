@@ -290,7 +290,9 @@ func (s *Server) serveToken(w http.ResponseWriter, r *http.Request) {
 			subjectKind:     r.FormValue("subject_kind"),
 			agent:           r.FormValue("agent"),
 			tenant:          r.FormValue("tenant"),
-			presentedAct:    r.Form["act"],
+
+			presentedAct:              r.Form["act"],
+			presentedRequestedSubject: r.Form["requested_subject"],
 		})
 	default:
 		tok, ttl, err = s.exchange(r.Context(), exchangeRequest{
@@ -339,6 +341,24 @@ type exchangeRequest struct {
 	agent            string // bare agent name, e.g. "order-assistant"
 }
 
+// knownKindPrefixes is every identity prefix this service assigns meaning
+// to — the claims-policy kinds plus the two it mints itself. It exists so
+// identityForKind and segmentKindFromIdentity share ONE notion of "this
+// string already names a kind": the two doors disagreeing about that was a
+// real defect, where exchange 1 would mint an "employee:customer:C-1" that
+// exchange 2 refuses outright.
+var knownKindPrefixes = []string{"customer:", "employee:", "agent:", "runner:"}
+
+// startsWithKnownKind reports whether identity opens with one of them.
+func startsWithKnownKind(identity string) bool {
+	for _, p := range knownKindPrefixes {
+		if strings.HasPrefix(identity, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // identityForKind builds the type-prefixed identity for a VERIFIED subject.
 //
 // An IdP may hand back a bare subject ("jdoe") or one that already carries
@@ -355,27 +375,33 @@ type exchangeRequest struct {
 // says "customer:" is either a misconfigured issuer or a subject claim
 // chosen to look like one, and both deserve to be seen rather than turned
 // into "employee:customer:C-1".
+//
+// A subject whose remainder ALSO opens with a known prefix
+// ("employee:employee:jdoe", "employee:customer:C-1") is refused for the
+// same reason, and so is a bare subject that is itself a prefixed identity
+// ("agent:order-assistant" from an employee IdP, which would otherwise be
+// prefixed into "employee:agent:order-assistant"). Every one of those is
+// the doubled identity program plan §7 item 10 describes; which half the
+// caller meant is not this service's call, and segmentKindFromIdentity
+// refuses all of them on the other door.
 func identityForKind(kind, subject string) (string, bool) {
-	for _, known := range []string{"customer", "employee"} {
-		rest, ok := strings.CutPrefix(subject, known+":")
-		if !ok {
-			continue
-		}
-		// The prefix is one this service recognises, so it MEANS the kind
-		// it spells. It must agree with the issuer's, and it must name
-		// somebody.
-		if known != kind || rest == "" {
-			return "", false
-		}
-		return subject, true
-	}
 	if subject == "" {
 		// Unreachable: parseUpstreamClaims already refuses a token with no
 		// sub. Refused here rather than assumed, so a later change there
 		// cannot quietly mint "employee:".
 		return "", false
 	}
-	return kind + ":" + subject, true
+	if !startsWithKnownKind(subject) {
+		return kind + ":" + subject, true
+	}
+	// The prefix is one this service recognises, so it MEANS the kind it
+	// spells. It must agree with the issuer's, and it must name somebody
+	// who is not themselves a prefixed identity.
+	rest, ok := strings.CutPrefix(subject, kind+":")
+	if !ok || rest == "" || startsWithKnownKind(rest) {
+		return "", false
+	}
+	return subject, true
 }
 
 // exchange2Request is the parsed form body of the GOVERNED door's POST
@@ -394,6 +420,15 @@ type exchange2Request struct {
 	agent           string   // bare agent name, e.g. "support-assistant"
 	tenant          string   // from InvocationContext.attribution.tenant (C-1)
 	presentedAct    []string // every `act` form value the caller sent, refused below
+
+	// presentedRequestedSubject is every `requested_subject` form value the
+	// caller sent, refused below. It is exchange 1's field: it names a
+	// customer an EMPLOYEE may act for, and it is honoured only after
+	// HandledBy passes against a VERIFIED employee token. There is no
+	// verified employee here, so honouring it would be impersonation with
+	// no check behind it, and silently ignoring it would mint a token that
+	// is not the one the caller asked for.
+	presentedRequestedSubject []string
 }
 
 // segmentKindFromIdentity reads the claims-policy segment kind off a
@@ -411,16 +446,32 @@ func segmentKindFromIdentity(identity string) (string, bool) {
 		if !ok || rest == "" {
 			continue
 		}
-		// A remainder that itself carries a kind prefix — "employee:
+		// A remainder that itself carries a known prefix — "employee:
 		// employee:jdoe", or "employee:customer:C-1" — is the doubled
 		// identity program plan §7 item 10 describes, arriving from a
 		// runner rather than from an IdP. Refused for the reason
 		// identityForKind refuses it: no tuple names it, and choosing
-		// which half the caller meant is not this service's call.
-		if _, doubled := segmentKindFromIdentity(rest); doubled {
+		// which half the caller meant is not this service's call. Both
+		// doors consult the same knownKindPrefixes, so neither can start
+		// accepting an identity the other rejects.
+		if startsWithKnownKind(rest) {
 			return "", false
 		}
 		return kind, true
+	}
+	return "", false
+}
+
+// firstNonEmpty returns the first non-blank value a repeated form field
+// carried, and whether there was one. A bare "act=" is not a delegated
+// caller and a bare "requested_subject=" names nobody, so only a value with
+// content refuses — but EVERY value is examined, not just the first, so a
+// caller cannot hide one behind a leading blank.
+func firstNonEmpty(values []string) (string, bool) {
+	for _, v := range values {
+		if v != "" {
+			return v, true
+		}
 	}
 	return "", false
 }
@@ -441,11 +492,19 @@ func (s *Server) exchange2(ctx context.Context, req exchange2Request) (string, t
 	// depth-one chain (human at sub, agent at act) and a runner that was
 	// itself delegated has nowhere to go in it. An empty `act=` is not a
 	// delegated caller, so only a non-empty value refuses.
-	for _, v := range req.presentedAct {
-		if v != "" {
-			s.deny(ctx, "governed door presented an act chain; the MVP supports a depth-one chain only", "act", v)
-			return "", 0, errDenied
-		}
+	if v, ok := firstNonEmpty(req.presentedAct); ok {
+		s.deny(ctx, "governed door presented an act chain; the MVP supports a depth-one chain only", "act", v)
+		return "", 0, errDenied
+	}
+
+	// requested_subject is exchange 1's field and is refused here the same
+	// way, for a sharper reason: it is only ever honoured behind HandledBy
+	// against a verified employee token, and this door has no verified
+	// anybody. See presentedRequestedSubject's comment.
+	if v, ok := firstNonEmpty(req.presentedRequestedSubject); ok {
+		s.deny(ctx, "governed door presented a requested_subject; it is exchange 1's field and is honoured only behind handled_by",
+			"requested_subject", v)
+		return "", 0, errDenied
 	}
 
 	// Step 1: client assertion + jti replay, exactly as exchange 1. The

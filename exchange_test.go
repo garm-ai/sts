@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,7 +51,7 @@ agents:
   write-bot:       { roles: [write-only] }
 `
 
-// fakeAuthz is a hand-rolled Authorizer: the three relations as plain maps,
+// fakeAuthz is a hand-rolled Authorizer: the four relations as plain maps,
 // set directly by each test rather than round-tripped through a YAML file,
 // so every test can build exactly the tuple set its scenario needs.
 type fakeAuthz struct {
@@ -58,6 +59,21 @@ type fakeAuthz struct {
 	canRun    map[[2]string]bool
 	handledBy map[[2]string]bool
 	inSegment map[[2]string]bool
+
+	// mu guards calls. The handler answers on the caller's goroutine, so
+	// nothing here is concurrent today; the mutex is what keeps that an
+	// implementation detail rather than something -race would discover if
+	// an exchange ever resolved segments in parallel.
+	mu sync.Mutex
+
+	// calls records every question asked of this authorizer, in order, so a
+	// test can assert not only WHAT was asked but WHEN and WHETHER. The
+	// governed door's CanRun-before-CanInvoke ordering is a security
+	// property, not a style choice — see
+	// TestExchange2AsksCanRunBeforeCanInvokeAndNeverProbesOnADeniedRun —
+	// and ordering is exactly the kind of property that survives a refactor
+	// only if something checks it.
+	calls []string
 }
 
 func newFakeAuthz() *fakeAuthz {
@@ -82,17 +98,45 @@ func (a *fakeAuthz) allowSegment(principal, segment string) {
 	a.inSegment[[2]string{principal, segment}] = true
 }
 
+func (a *fakeAuthz) record(format string, args ...any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls = append(a.calls, fmt.Sprintf(format, args...))
+}
+
+// recorded returns a copy of the call log, so a test reading it cannot be
+// affected by a later call appending to the original.
+func (a *fakeAuthz) recorded() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.calls...)
+}
+
 func (a *fakeAuthz) CanInvoke(_ context.Context, principal, agent string) (bool, error) {
+	a.record("CanInvoke(%s, %s)", principal, agent)
 	return a.canInvoke[[2]string{principal, agent}], nil
 }
 func (a *fakeAuthz) CanRun(_ context.Context, runner, agent string) (bool, error) {
+	a.record("CanRun(%s, %s)", runner, agent)
 	return a.canRun[[2]string{runner, agent}], nil
 }
 func (a *fakeAuthz) HandledBy(_ context.Context, employee, customer string) (bool, error) {
+	a.record("HandledBy(%s, %s)", employee, customer)
 	return a.handledBy[[2]string{employee, customer}], nil
 }
 func (a *fakeAuthz) InSegment(_ context.Context, principal, segment string) (bool, error) {
+	a.record("InSegment(%s, %s)", principal, segment)
 	return a.inSegment[[2]string{principal, segment}], nil
+}
+
+// firstCallTo returns the index of the first recorded call to name, or -1.
+func firstCallTo(calls []string, name string) int {
+	for i, c := range calls {
+		if strings.HasPrefix(c, name+"(") {
+			return i
+		}
+	}
+	return -1
 }
 
 var _ sts.Authorizer = (*fakeAuthz)(nil)
@@ -929,6 +973,24 @@ func TestExchangeRefusesASubjectWhoseKindPrefixContradictsItsIssuer(t *testing.T
 	if resp := f.do(f.form(f.employeeToken("employee:", nil), "", "order-assistant")); resp.StatusCode == http.StatusOK {
 		t.Fatal("minted for a subject that is nothing but a kind prefix")
 	}
+
+	// A subject whose REMAINDER also carries a known prefix is the same
+	// doubled identity, reached from the other side. The governed door's
+	// segmentKindFromIdentity refuses "employee:employee:jdoe" and
+	// "employee:customer:C-1" outright, and the two doors must not disagree
+	// about what an identity is — one minting what the other refuses is how
+	// a tuple set comes to look correct while half the traffic misses it.
+	for _, doubled := range []string{"employee:employee:jdoe", "employee:customer:C-1"} {
+		if resp := f.do(f.form(f.employeeToken(doubled, nil), "", "order-assistant")); resp.StatusCode == http.StatusOK {
+			t.Fatalf("minted for the doubled identity %q; the governed door refuses exactly this string", doubled)
+		}
+	}
+
+	// And a bare subject that is itself a prefixed identity would otherwise
+	// be prefixed AGAIN, into "employee:agent:order-assistant".
+	if resp := f.do(f.form(f.employeeToken("agent:order-assistant", nil), "", "order-assistant")); resp.StatusCode == http.StatusOK {
+		t.Fatal("minted for a subject that already names another kind of principal entirely")
+	}
 }
 
 // --- program plan §3.9: the governed door ---------------------------------
@@ -1025,8 +1087,14 @@ func TestExchange2RefusesAnOnBehalfOfWithNoTypePrefix(t *testing.T) {
 	authz.allowRun("runner:shop-bff", "agent:order-assistant")
 	f := newFixture(t, exchangePolicy, authz, enforced)
 
+	// There is deliberately no "" row here: an empty on_behalf_of means the
+	// field is ABSENT, which selects exchange 1 at the dispatch and never
+	// reaches this door at all. It is refused (no subject_token verifies),
+	// but for an unrelated reason, so asserting it here would have been a
+	// row that passes whatever this door does. The bare "jdoe" row below is
+	// the case that "" was reaching for, and it does reach exchange 2.
 	for _, bad := range []string{
-		"jdoe", "", ":jdoe", "employee:", "vendor:jdoe",
+		"jdoe", ":jdoe", "employee:", "vendor:jdoe",
 		// Doubled prefixes, the runner-side form of program plan §7
 		// item 10. authz.allowInvoke above is written for the bare
 		// reading, not these.
@@ -1064,6 +1132,13 @@ func TestExchange2RefusalsAreOpaqueAndComplete(t *testing.T) {
 	presentedAct := good()
 	presentedAct.Set("act", "employee:someone-else")
 
+	// requested_subject is exchange 1's field, honoured only behind
+	// handled_by against a VERIFIED employee token. This door has no
+	// verified anybody, so honouring it would be impersonation with nothing
+	// behind it and ignoring it would mint a token nobody asked for.
+	presentedRequestedSubject := good()
+	presentedRequestedSubject.Set("requested_subject", "customer:C-8123")
+
 	badKind := good()
 	badKind.Set("subject_kind", "AGENT")
 
@@ -1086,6 +1161,7 @@ func TestExchange2RefusalsAreOpaqueAndComplete(t *testing.T) {
 		"no can_run tuple for this runner and agent": noCanRun,
 		"no can_invoke tuple for the named subject":  noCanInvoke,
 		"the runner presented an act chain":          presentedAct,
+		"the runner presented a requested_subject":   presentedRequestedSubject,
 		"subject_kind is neither USER nor SERVICE":   badKind,
 		"subject_kind SERVICE":                       serviceKind,
 		"no tenant":                                  noTenant,
@@ -1185,4 +1261,100 @@ func TestBothDoorsMintTheSameTokenApartFromExec(t *testing.T) {
 	if a, b := normalize(direct), normalize(governed); a != b {
 		t.Fatalf("the two doors minted different tokens for the same subject and agent.\n direct: %s\ngoverned: %s", a, b)
 	}
+}
+
+// --- the CanRun gate, made load-bearing -----------------------------------
+
+// Everything here is set up to succeed EXCEPT can_run: the subject is in a
+// segment, it may invoke this agent, the tenant is named, the assertion
+// verifies, and the verb intersection is non-empty. So the only thing that
+// can refuse is the gate, and deleting the gate mints a token.
+//
+// This is deliberately not the `write-bot` row in
+// TestExchange2RefusalsAreOpaqueAndComplete: support-staff holds READ and
+// write-only holds WRITE, so that row's verb intersection is empty and
+// resolveAndMint would refuse it with the gate gone. It refuses for the
+// right reason today and would keep refusing for a wrong one, which is the
+// definition of a test that is not load-bearing.
+func TestExchange2RefusesARunnerWithNoCanRunTuple(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	// and deliberately NO allowRun("runner:shop-bff", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	resp := f.do(f.form2("employee:jdoe", "USER", "order-assistant", "acme"))
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("minted for a runner with no can_run tuple, on a request where every other check passes; " +
+			"on_behalf_of is asserted and verified against no IdP, so can_run is the only thing standing between this door and impersonation")
+	}
+
+	// The same request with the one missing tuple written mints, so the
+	// refusal above is that tuple's absence and nothing else.
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+	if resp := f.do(f.form2("employee:jdoe", "USER", "order-assistant", "acme")); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d with the can_run tuple written; the refusal above proves nothing unless this mints", resp.StatusCode)
+	}
+}
+
+// CanRun is asked BEFORE CanInvoke, and a denied CanRun stops the exchange
+// without asking CanInvoke at all.
+//
+// The order is a security property, not a style choice. on_behalf_of is
+// ASSERTED by the runner and verified against no IdP; the only reason to
+// look at it is a written tuple saying this runner may execute this agent.
+// Asking CanInvoke first would answer "may this subject reach that agent"
+// for any caller who can reach the endpoint, whether or not they were ever
+// entitled to run it — an entitlement oracle, reachable by anyone holding
+// any valid client assertion.
+func TestExchange2AsksCanRunBeforeCanInvokeAndNeverProbesOnADeniedRun(t *testing.T) {
+	t.Run("granted: can_run is asked, and asked first", func(t *testing.T) {
+		authz := newFakeAuthz()
+		authz.allowSegment("employee:jdoe", "support-staff")
+		authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+		authz.allowRun("runner:shop-bff", "agent:order-assistant")
+		f := newFixture(t, exchangePolicy, authz, enforced)
+
+		f.mint(f.form2("employee:jdoe", "USER", "order-assistant", "acme"))
+
+		calls := f.authz.recorded()
+		run, invoke := firstCallTo(calls, "CanRun"), firstCallTo(calls, "CanInvoke")
+		if run < 0 {
+			t.Fatalf("CanRun was never asked on the governed door; calls: %v", calls)
+		}
+		if invoke < 0 {
+			t.Fatalf("CanInvoke was never asked; calls: %v", calls)
+		}
+		if run > invoke {
+			t.Fatalf("CanInvoke (index %d) was asked before CanRun (index %d); an unauthorised runner must never get an entitlement answer.\ncalls: %v",
+				invoke, run, calls)
+		}
+	})
+
+	t.Run("denied: can_invoke is never asked at all", func(t *testing.T) {
+		authz := newFakeAuthz()
+		authz.allowSegment("employee:jdoe", "support-staff")
+		// The subject genuinely MAY invoke this agent — so if the door asked,
+		// it would get a "yes" it had no business asking for.
+		authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+		// The runner may not run it.
+		f := newFixture(t, exchangePolicy, authz, enforced)
+
+		if resp := f.do(f.form2("employee:jdoe", "USER", "order-assistant", "acme")); resp.StatusCode == http.StatusOK {
+			t.Fatal("minted despite no can_run tuple")
+		}
+
+		calls := f.authz.recorded()
+		if firstCallTo(calls, "CanRun") < 0 {
+			t.Fatalf("CanRun was never asked; calls: %v", calls)
+		}
+		if i := firstCallTo(calls, "CanInvoke"); i >= 0 {
+			t.Fatalf("CanInvoke was asked (%q) after CanRun denied; the refusal is now an entitlement oracle — "+
+				"a caller who may run nothing still learns who may invoke what.\ncalls: %v", calls[i], calls)
+		}
+		// Nor did it get as far as resolving anybody's segments.
+		if i := firstCallTo(calls, "InSegment"); i >= 0 {
+			t.Fatalf("InSegment was asked (%q) after CanRun denied; the exchange should have stopped at the gate.\ncalls: %v", calls[i], calls)
+		}
+	})
 }

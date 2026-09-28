@@ -1,38 +1,65 @@
 # sts — an RFC 8693 security token service
 
-A small Go service implementing exactly **one** RFC 8693 token exchange: a
-backend-for-frontend (BFF) trades a verified customer or employee token for a
-short-lived delegation token naming one agent. That token carries a `garm`
-claim — this service's authority claim, not OAuth `scope` — which the
-verifying daemon (`garmd`) uses to decide what the agent may do.
+A small Go service implementing **two** RFC 8693 token exchanges, both
+minting the same short-lived delegation token naming one agent. That token
+carries a `garm` claim — this service's authority claim, not OAuth `scope` —
+which the verifying daemon (`garmd`) uses to decide what the agent may do.
 
-This is not a general-purpose STS. There is one exchange, one claim shape,
-and one authorization port. What follows describes exactly what exists.
+- **The direct door** (exchange 1): a backend-for-frontend (BFF) presents a
+  customer or employee token, **verified** against its issuer's JWKS, and
+  trades it for a delegation token.
+- **The governed door** (exchange 2): a *runner* — a process that executes
+  agents, with no human token to present — authenticates as itself and
+  **asserts** which subject it is acting for. Nothing verifies that
+  assertion, so it is gated on a written `can_run` tuple saying this runner
+  may execute this agent at all, and the minted token records which runner
+  obtained it in a top-level `exec` claim.
+
+This is not a general-purpose STS. There are two exchanges, one claim shape,
+one minting path shared by both doors, and one authorization port. What
+follows describes exactly what exists.
 
 ## What this service does
 
 ```
 customer/employee IdP ──(verify subject_token)──┐
-                                                  ▼
-BFF ──POST /token (client_assertion)────────▶ ┌───────┐
-      grant_type=token-exchange               │  STS  │──▶ mints a delegation token
-      subject_token=<human token>             └───────┘     `aud`=garmd, `garm`={...}, `act`={agent}
-      agent=<agent name>
+                                                ▼
+BFF ────POST /token (client_assertion)────▶ ┌───────┐
+        grant_type=token-exchange           │       │
+        subject_token=<human token>         │       │──▶ mints a delegation token
+        agent=<agent name>                  │  STS  │    `aud`=garmd, `garm`={...}, `act`={agent}
+                                            │       │    (+ `exec`={runner}, governed door only)
+runner ──POST /token (client_assertion)───▶ │       │
+         grant_type=token-exchange          └───────┘
+         on_behalf_of=<prefixed subject>       ▲
+         subject_kind=USER  agent=<name>       │
+         tenant=<tenant>                   can_run
 ```
 
-1. The BFF authenticates itself to `POST /token` with a `client_assertion`
-   (`private_key_jwt`, RFC 7523) — a short-lived JWT it signs itself,
+`subject_token` selects the direct door and `on_behalf_of` selects the
+governed one. A request carrying both is refused: there is no exchange that
+means both, and quietly preferring one would mint a token from a verified
+identity when an asserted one was asked for, or the reverse.
+
+1. The caller — a BFF on the direct door, a runner on the governed one —
+   authenticates itself to `POST /token` with a `client_assertion`
+   (`private_key_jwt`, RFC 7523): a short-lived JWT it signs itself,
    proving it holds a registered private key. The signature and a
    single-use `jti` are checked by `ClientRegistry` (`clients.go`).
-2. The BFF's `subject_token` (a customer or employee token) is verified
-   against its own issuer's JWKS by `Verifier` (`issuer.go`). Which issuer
-   means "customer" and which means "employee" is per-issuer configuration
-   (`TrustedIssuer.Kind`), never sniffed from the token.
-3. Three yes/no questions are asked of an `Authorizer` (`authz.go`):
-   `CanInvoke` (may this principal reach this agent at all), `HandledBy`
-   (for an employee acting on a named customer's behalf — the line between
-   helping a customer and impersonating one), and `InSegment` (which of the
-   policy's declared segments the principal belongs to).
+2. **On the direct door**, the `subject_token` (a customer or employee
+   token) is verified against its own issuer's JWKS by `Verifier`
+   (`issuer.go`). Which issuer means "customer" and which means "employee"
+   is per-issuer configuration (`TrustedIssuer.Kind`), never sniffed from
+   the token. **On the governed door** there is no subject token at all:
+   the runner names a type-prefixed subject in `on_behalf_of`, and the
+   prefix it carries decides the kind, into a closed set.
+3. Four yes/no questions are asked of an `Authorizer` (`authz.go`):
+   `CanRun` (may this runner execute this agent — the governed door only,
+   and asked *before* any other authorization question), `CanInvoke` (may this
+   principal reach this agent at all), `HandledBy` (for an employee acting
+   on a named customer's behalf — the line between helping a customer and
+   impersonating one), and `InSegment` (which of the policy's declared
+   segments the principal belongs to).
 4. A claims policy (`claims.go`, loaded from a YAML file — see
    `deploy/claims.yaml`) turns segment membership into a `GarmClaim`: a
    clearance, a set of compartments, a set of verbs, and optional tool
@@ -41,12 +68,40 @@ BFF ──POST /token (client_assertion)────────▶ ┌───
    the `Authorizer`, never the policy file.
 5. A signed token is minted by `Keyring` (`keyring.go`) with ES256 over
    P-256, and its public keys are served as a JWKS at
-   `/.well-known/jwks.json` for `garmd` to verify against.
+   `/.well-known/jwks.json` for `garmd` to verify against. Both doors reach
+   this through **one** function (`resolveAndMint`), so "the two doors mint
+   the same token" is a property of the code rather than of two
+   implementations agreeing — a test asserts the two outputs are identical
+   apart from `exec`, `jti`, `iat` and `exp`.
+
+### The governed door's request
+
+`POST /token`, `application/x-www-form-urlencoded`:
+
+| Field | Value |
+|---|---|
+| `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` |
+| `client_assertion_type` | `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` |
+| `client_assertion` | the runner's `private_key_jwt`, exactly as the direct door |
+| `on_behalf_of` | type-prefixed subject, e.g. `employee:jdoe` — **required**, and its prefix must be `customer:` or `employee:` |
+| `subject_kind` | `USER` (`SERVICE` is refused: it has no claims-policy path in this version) |
+| `agent` | bare agent name, e.g. `order-assistant` — **required** |
+| `tenant` | the tenant this run belongs to — **required**, for the same reason the direct door refuses a subject token carrying none |
+
+The runner identity is `runner:<client_id>` taken from the **authenticated**
+client assertion. There is no form field that names it, which is what keeps
+`runner:` out of a caller's control. A presented `act` or `requested_subject`
+is refused rather than ignored — the first because the MVP mints a depth-two
+chain and a runner that was itself delegated has nowhere to go in it, the
+second because `requested_subject` is only ever honoured behind `HandledBy`
+against a verified employee token and this door has no verified anybody.
 
 ## The token shape
 
-There is no `scope` claim anywhere in a minted token. `garm` replaces it
-entirely:
+Both doors mint this shape. There is no `scope` claim anywhere in it —
+`garm` replaces it entirely — and the only difference between a direct-door
+token and a governed-door one is `exec`, shown here and present **only** on
+the governed door's:
 
 ```json
 {
@@ -58,6 +113,10 @@ entirely:
   "act": {
     "sub": "agent:order-assistant",
     "garm": { "clearance": "INTERNAL", "verbs": ["READ"], "kind": "AGENT" }
+  },
+  "exec": {
+    "sub": "runner:agentd",
+    "iss": "https://sts.internal.example.com"
   },
   "exp": 1780000000,
   "iat": 1779999400,
@@ -80,6 +139,16 @@ entirely:
   `act.act` is a *prior* actor. On the employee-for-customer path the chain
   is `sub`=customer → `act`=agent → `act.act`=employee: the employee
   obtained the token earlier, the agent is exercising it now.
+- **`exec`** is present on **governed-door tokens only** and names the
+  runner that obtained the token, plus this service as what attests the
+  runner authenticated. A direct-door token has no `exec` key at all — not a
+  null, not an empty object — so "was this token obtained by a runner" is
+  answerable from the token's shape. It is **provenance, not authority**:
+  exactly two fields, outside the `act` chain, never folded. A runner placed
+  in `act` instead would have to either assert a `garm` claim it has no
+  business asserting or carry an all-permissive one that narrows nothing,
+  and both read as authority to anyone who later looks at a token or a
+  ledger row.
 - **`garm.clearance`** is one of `PUBLIC`, `INTERNAL`, `CONFIDENTIAL`,
   `RESTRICTED` (the bare spelling; `garmd` also accepts `CLEARANCE_*`).
   An agent's own authority is minted at `act.garm` **unnarrowed** — this
@@ -90,10 +159,9 @@ entirely:
 
 ## What is NOT built
 
-- **Exchange 2** (runner + delegation → on-behalf-of, e.g. for a NATS
-  callout) does not exist. There is one `POST /token` handler and it
-  implements exchange 1 only.
-- **The runner / agent-runner broker** is not part of this service.
+- **The runner itself / the agent-runner broker** is not part of this
+  service. This service mints *for* a runner (the governed door above); it
+  does not execute agents, and it has no view of whether a run happened.
 - **The NATS auth callout integration** is not part of this service.
 - **A second `Authorizer` implementation beyond these two.** There are
   two, and which one a binary has is fixed when it is built, not at
@@ -246,11 +314,11 @@ timeout for in-flight requests to finish.
 | `keyring.go` | Signs tokens (ES256), serves the JWKS |
 | `issuer.go` | Verifies upstream tokens against their issuer's JWKS |
 | `claims.go` | The claims policy: roles, segments, agent authority |
-| `authz.go` | The `Authorizer` interface — three yes/no questions |
+| `authz.go` | The `Authorizer` interface — four yes/no questions |
 | `authz_static.go` | A flat, file-backed `Authorizer` (dev/CI; untagged builds) |
 | `authz_openfga.go` | The OpenFGA-backed `Authorizer` (production; `-tags openfga`) |
 | `clients.go` | `private_key_jwt` client authentication + replay protection |
-| `exchange.go` | The `POST /token` handler: the whole exchange, in order |
+| `exchange.go` | The `POST /token` handler: both doors, in order, and the one minting path they share |
 | `config.go` | Loads and validates `deploy/config.yaml`'s shape, wires a `Server` |
 | `cmd/sts/main.go` | The binary: flags, logging, TLS, graceful shutdown |
 | `cmd/sts/authz_static.go`, `cmd/sts/authz_openfga.go` | Which `Authorizer` this build gets — mutually exclusive build tags |
@@ -258,7 +326,7 @@ timeout for in-flight requests to finish.
 | `deploy/claims.yaml` | An example claims policy |
 | `deploy/tuples.yaml` | An example static-authorizer tuple file |
 | `deploy/keygen.sh` | Generates a signing key and a BFF client keypair |
-| `deploy/model.fga` | The OpenFGA authorization model backing the three `Authorizer` checks |
+| `deploy/model.fga` | The OpenFGA authorization model backing the four `Authorizer` checks |
 | `deploy/tuples.openfga.yaml` | The same example facts as `deploy/tuples.yaml`, in OpenFGA's derived encoding |
 
 ## Security notes
@@ -278,6 +346,21 @@ timeout for in-flight requests to finish.
   honored after `HandledBy` succeeds. Keep that relation accurate; it is
   the line between an employee helping a customer and one impersonating
   them.
+- **`on_behalf_of` is asserted, never verified.** The governed door has no
+  IdP token to check it against, so `CanRun` is the whole of what makes it
+  acceptable: a written tuple saying this runner may execute this agent.
+  It is asked **before** `CanInvoke`, deliberately — asking `CanInvoke`
+  first would answer "may this subject reach that agent" for anyone holding
+  any valid client assertion, turning the refusal into an entitlement
+  oracle. Keep `can_run` tuples as tight as `handled_by` ones; remove the
+  gate and `on_behalf_of` becomes an impersonation field.
+- **Identities are prefixed exactly once.** A subject that already carries
+  its issuer's kind (`employee:jdoe`) is used as is, a bare one is prefixed,
+  and one whose prefix contradicts its issuer — or which would double into
+  `employee:employee:jdoe` — is refused rather than repaired. A doubled
+  identity matches no tuple, and the resulting miss is indistinguishable
+  from an ordinary denial, which sends an operator to their tuple store
+  instead of to their token.
 - **Algorithm allowlist.** Both upstream token verification and client
   assertion verification share one allowlist (`permittedAlgorithms`):
   ES256/384/512, RS256/384/512, PS256/384/512. `none` and any HMAC
