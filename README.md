@@ -264,10 +264,23 @@ The grant itself:
 
 ## What is NOT built
 
-- **The runner itself / the agent-runner broker** is not part of this
-  service. This service mints *for* a runner (the governed door above); it
-  does not execute agents, and it has no view of whether a run happened.
+- **A runner.** This service mints *for* one (exchange 2 above, gated on a
+  `can_run` tuple), but the runner itself is `garm-ai/agentd`, not part of
+  this service. It does not execute agents, and it has no view of whether a
+  run happened.
+- **`subject_kind: SERVICE`.** The field is accepted and validated, and a
+  `SERVICE` subject is refused: the claims policy resolves authority from
+  segment membership and `ForSegments` always mints `kind: USER`. A service
+  principal has no path through it, and inventing one here would be
+  inventing policy.
 - **The NATS auth callout integration** is not part of this service.
+- **Queueing for approvals.** `POST /approve` is stateless: a request
+  arrives carrying everything and a grant leaves. Nothing here holds pending
+  approvals, notifies an approver, or renders a screen — that is product
+  surface above this, and the grant format does not depend on it.
+- **Multi-party approval and revocation.** One grant, one approver; a grant
+  is valid until it expires or is spent. Short lifetimes are the mitigation
+  and a revocation list is not built.
 - **Deciding whether an approver is allowed to approve.** This service
   *attests* — it records who approved and what authority their own token
   asserted — and `garmd` *decides*, because the catalogue is what knows
@@ -346,6 +359,13 @@ mysterious failure discovered at the first request:
   > this service's `audience` is set to. The value here is deliberately not
   > changed to garmd's default: `garm://garmd` is the more correct
   > identifier, and garmd's audience is explicitly configurable.
+- `delegationTTL` — how long a minted **delegation token** (`POST /token`,
+  either door) is valid, as a Go duration string (`10m`). Omitted or `0`, it
+  is `NewServer`'s own default (10 minutes) rather than a second default
+  living here, for the same reason `approve.ttl_seconds` isn't defaulted in
+  `LoadConfig` either. It bounds a different thing than `approve.ttl_seconds`
+  below: a delegation token is a session, a grant is a decision, and the two
+  are not meant to expire on the same schedule.
 - `keys.active` and `keys.keys[]` — at least one signing key; `active` must
   name one of them. **Signing keys are never inlined.** Each key's `pem`
   field is a reference to an environment variable (`$NAME` or `${NAME}`)
@@ -509,3 +529,15 @@ timeout for in-flight requests to finish.
   ES256/384/512, RS256/384/512, PS256/384/512. `none` and any HMAC
   algorithm are excluded because there would be nothing to check a
   signature against; EdDSA is excluded to match `garmd`'s own verifier.
+- **A delegated identity cannot approve**, and it is enforced twice: this
+  service refuses to mint from an approver token carrying `act`, and `garmd`
+  refuses a grant that carries one. Either alone suffices for an honest
+  issuer; both are required because the rule exists to survive a dishonest
+  one.
+- **A runner's identity is derived, never supplied.** Exchange 2's
+  `runner:<id>` comes from the client id the caller authenticated as. There
+  is no form field for it.
+- **The approval endpoint holds no state.** No pending approvals, no
+  queue — so there is nothing here for an attacker to enumerate or exhaust,
+  and the only rate limit that matters is the client-assertion replay cache
+  described above.
