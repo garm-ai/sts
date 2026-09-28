@@ -1,14 +1,33 @@
-# Sample OpenFGA relationship tuples. Write with the fga CLI.
-# fga tuple write --store-id <id> --file deploy/tuples.openfga.yaml
-- user: segment:retail#member
+# Sample OpenFGA relationship tuples, encoding the same real-world facts as
+# deploy/tuples.yaml (see deploy/model.fga for the relations these use).
+# Write with: fga tuple write --store-id <id> --file deploy/tuples.openfga.yaml
+#
+# can_invoke is DERIVED here rather than written directly: customer:C can
+# invoke agent:order-assistant only because it is a member of segment
+# retail-vip, and agent:order-assistant is invokable_by that segment's
+# members. deploy/tuples.yaml records the same fact as a flat, already
+# resolved can_invoke tuple instead — see that file's header and
+# authz_openfga_parity_test.go, which checks both backends answer identically.
+- user: segment:retail-vip#member
   relation: invokable_by
   object: agent:order-assistant
 - user: customer:C
   relation: member
-  object: segment:retail
-- user: runner:agent-runner
-  relation: runnable_by
+  object: segment:retail-vip
+
+# The employee side of the same derivation. Both halves are needed for the
+# delegating path (an employee acting for a customer they handle): exchange.go
+# asks can_invoke TWICE there, once for the customer and once for the
+# employee, and the employee's own claim is resolved from their own segment.
+# Without these two tuples the handled_by tuple below can never be exercised.
+- user: segment:support-staff#member
+  relation: invokable_by
   object: agent:order-assistant
+- user: employee:jdoe
+  relation: member
+  object: segment:support-staff
+
+# handled_by: employee:jdoe is the one assigned to customer:C.
 - user: employee:jdoe
   relation: handled_by
   object: customer:C

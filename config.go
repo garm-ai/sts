@@ -64,12 +64,31 @@ type Config struct {
 	// PolicyPath is the claims policy file (see LoadPolicy).
 	PolicyPath string
 	// StaticAuthzPath is the static authorizer tuples file (see
-	// LoadStaticAuthorizer). Config does not load it itself — main chooses
-	// which Authorizer implementation to build (static today; OpenFGA is a
-	// later task) and passes the result to Build.
+	// LoadStaticAuthorizer). Config does not load it itself — which
+	// Authorizer implementation a binary builds is chosen by its build tag,
+	// not at runtime (see cmd/sts/authz_static.go and
+	// cmd/sts/authz_openfga.go), and the result is passed to Build.
 	StaticAuthzPath string
 
+	// OpenFGA carries the OpenFGA store connection details. LoadConfig
+	// always parses these fields, whether or not the running binary can use
+	// them — an untagged build ignores them entirely, and only a binary
+	// built with -tags openfga (cmd/sts/authz_openfga.go) requires ApiURL
+	// and StoreID to be set. See deploy/config.yaml's authz.openfga block.
+	OpenFGA OpenFGAConfig
+
 	InstanceAuthorization InstanceAuthzConfig
+}
+
+// OpenFGAConfig is the connection configuration for the OpenFGA-backed
+// Authorizer (authz_openfga.go, built only under -tags openfga).
+// AuthorizationModelID is optional — leave it empty only for local
+// development; production should pin it, since an unpinned store silently
+// reinterprets every check the moment a new model version is written.
+type OpenFGAConfig struct {
+	ApiURL               string
+	StoreID              string
+	AuthorizationModelID string
 }
 
 // --- on-disk shape -------------------------------------------------------
@@ -91,7 +110,12 @@ type configFile struct {
 
 	Policy string `yaml:"policy"`
 	Authz  struct {
-		Static string `yaml:"static"`
+		Static  string `yaml:"static"`
+		OpenFGA struct {
+			ApiURL               string `yaml:"apiUrl"`
+			StoreID              string `yaml:"storeId"`
+			AuthorizationModelID string `yaml:"modelId"`
+		} `yaml:"openfga"`
 	} `yaml:"authz"`
 
 	InstanceAuthorization struct {
@@ -143,7 +167,16 @@ func resolveSecretEnvRef(field, raw string) (string, error) {
 	}
 	m := envRefPattern.FindStringSubmatch(raw)
 	if m == nil {
-		return "", fmt.Errorf("%s must be an environment variable reference ($NAME or ${NAME}), not inline material; got %q", field, raw)
+		// The rejected value is NOT echoed. This branch's whole purpose is
+		// to catch an operator who pasted a private key into the config
+		// file, so raw is, precisely when this check matters most, the key
+		// itself — and this error is written to stdout by cmd/sts/main.go's
+		// JSON slog handler, which is to say into the logs of a
+		// crash-looping pod and from there into a log aggregator with wider
+		// access and longer retention than the config file ever had. The
+		// length is enough for the operator to recognize which field they
+		// got wrong without reproducing the secret anywhere.
+		return "", fmt.Errorf("%s must be an environment variable reference ($NAME or ${NAME}), not inline material; got a %d-byte literal value", field, len(raw))
 	}
 	name := m[1]
 	val, ok := os.LookupEnv(name)
@@ -198,6 +231,11 @@ func LoadConfig(path string) (*Config, error) {
 		TokenEndpointAudience: cf.TokenEndpointAudience,
 		PolicyPath:            cf.Policy,
 		StaticAuthzPath:       cf.Authz.Static,
+		OpenFGA: OpenFGAConfig{
+			ApiURL:               cf.Authz.OpenFGA.ApiURL,
+			StoreID:              cf.Authz.OpenFGA.StoreID,
+			AuthorizationModelID: cf.Authz.OpenFGA.AuthorizationModelID,
+		},
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = defaultListen
@@ -262,6 +300,15 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("sts: config: issuers is empty; at least one trusted issuer is required")
 	}
 	issuers := make([]TrustedIssuer, 0, len(cf.Issuers))
+	// seenIssuer catches two entries sharing an `iss`. NewVerifier keys its
+	// lookup table by Issuer, so a duplicate silently wins on last write —
+	// and since TrustedIssuer.Kind is the sole input to the caller's kind,
+	// which decides whether instanceAuthorization's clearance cap runs at
+	// all, a second entry saying kind: employee would turn the customer cap
+	// off for that IdP with no diagnostic anywhere. Reject it here, the way
+	// NewKeyring rejects a duplicate kid and NewClientRegistry a duplicate
+	// client id.
+	seenIssuer := make(map[string]int, len(cf.Issuers))
 	for i, isf := range cf.Issuers {
 		if isf.Name == "" {
 			return nil, fmt.Errorf("sts: config: issuers[%d].name is empty", i)
@@ -269,8 +316,22 @@ func LoadConfig(path string) (*Config, error) {
 		if isf.Issuer == "" {
 			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): iss is empty", i, isf.Name)
 		}
+		if first, dup := seenIssuer[isf.Issuer]; dup {
+			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): duplicate iss %q, already configured by issuers[%d] (%s); "+
+				"two entries for one issuer would silently keep only the last, including its kind",
+				i, isf.Name, isf.Issuer, first, cf.Issuers[first].Name)
+		}
+		seenIssuer[isf.Issuer] = i
 		if isf.JWKS == "" {
 			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): jwks is empty", i, isf.Name)
+		}
+		// An empty audience list makes every token from this issuer fail
+		// containment (see Verifier.checkRegistered), so an issuer
+		// configured without one can never serve a request — a startup
+		// failure, not a denial per request.
+		if len(isf.Audience) == 0 {
+			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): audience is empty; "+
+				"without it every token from this issuer fails the audience check", i, isf.Name)
 		}
 		if isf.Kind != "customer" && isf.Kind != "employee" {
 			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): kind %q must be \"customer\" or \"employee\"", i, isf.Name, isf.Kind)
@@ -287,6 +348,14 @@ func LoadConfig(path string) (*Config, error) {
 
 	// --- clients ------------------------------------------------------------
 
+	// A config with no clients loads, binds, serves its JWKS, and denies
+	// every POST /token with "unknown client" — a service that cannot
+	// perform the one exchange it exists to perform. That is a startup
+	// failure for the same reason an empty issuers or keys.keys list is.
+	if len(cf.Clients) == 0 {
+		return nil, fmt.Errorf("sts: config: clients is empty; at least one client is required, " +
+			"or every POST /token is denied as an unknown client")
+	}
 	clients := make([]ClientConfig, 0, len(cf.Clients))
 	for i, cl := range cf.Clients {
 		if cl.ID == "" {
@@ -327,9 +396,9 @@ func LoadConfig(path string) (*Config, error) {
 
 // Build wires a loaded Config's pieces — keyring, verifier, claims policy
 // and client registry — into a running Server. authz is supplied by the
-// caller rather than built here, because which Authorizer implementation to
-// use (the static, file-backed one today; OpenFGA in a later task) is a
-// decision main makes, not one this file needs to know about.
+// caller rather than built here, because which Authorizer implementation a
+// binary has is decided by its build tag (see cmd/sts/authz_static.go and
+// cmd/sts/authz_openfga.go), not something this file needs to know about.
 //
 // ctx is accepted for symmetry with the rest of this package's
 // context-aware constructors and to leave room for a future step here that

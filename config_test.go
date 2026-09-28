@@ -127,16 +127,70 @@ func TestLoadConfigRejectsInlineKeyMaterial(t *testing.T) {
 	// A config file that could hold a private key is exactly what this
 	// design refuses to allow: the pem field must be an env-var reference,
 	// never the key itself, even if an operator pastes it in directly.
+	//
+	// The second half of this test is the point of the first: the error
+	// this rejection produces is written to stdout by cmd/sts/main.go, so
+	// it must not carry the material it just refused. The body line is a
+	// distinctive sentinel rather than a plausible-looking key precisely so
+	// the "does not appear in the error" assertion is checking something —
+	// a generic "not-really-a-key" could be absent from the message by
+	// accident.
+	const secretSentinel = "SUPERSECRET-DO-NOT-LOG-a7f3c1e9"
+
 	dir := t.TempDir()
 	writeFile(t, dir, "claims.yaml", validPolicyYAML)
 	writeFile(t, dir, "tuples.yaml", validStaticAuthzYAML)
 
 	cfgYAML := baseConfigYAML(dir, "IRRELEVANT")
-	cfgYAML = strings.Replace(cfgYAML, "pem: $IRRELEVANT", "pem: |\n        -----BEGIN EC PRIVATE KEY-----\n        not-really-a-key\n        -----END EC PRIVATE KEY-----", 1)
+	cfgYAML = strings.Replace(cfgYAML, "pem: $IRRELEVANT", "pem: |\n        -----BEGIN EC PRIVATE KEY-----\n        "+secretSentinel+"\n        -----END EC PRIVATE KEY-----", 1)
 	path := writeFile(t, dir, "config.yaml", cfgYAML)
 
-	if _, err := sts.LoadConfig(path); err == nil {
+	_, err := sts.LoadConfig(path)
+	if err == nil {
 		t.Fatal("LoadConfig accepted inline key material in keys.keys[].pem")
+	}
+	if strings.Contains(err.Error(), secretSentinel) {
+		t.Fatalf("LoadConfig's rejection of inline key material reproduced the key material in its error, "+
+			"which cmd/sts/main.go writes to stdout; error was: %v", err)
+	}
+	// The message still has to be actionable: it must name the field the
+	// operator got wrong, even though it may not quote its value.
+	if !strings.Contains(err.Error(), "keys.keys[0]") {
+		t.Fatalf("LoadConfig's rejection does not name the offending field; error was: %v", err)
+	}
+}
+
+// TestLoadConfigRejectsADuplicateIssuer pins the one config mistake whose
+// consequence is a silently weaker gate rather than a startup failure.
+// NewVerifier keys its issuer table by `iss`, so two entries sharing one
+// would keep only the last — and TrustedIssuer.Kind is the sole input to the
+// caller's kind, which decides whether instanceAuthorization's clearance cap
+// runs at all. A second entry saying kind: employee would therefore turn the
+// customer cap off for that IdP, silently, from a clean start.
+func TestLoadConfigRejectsADuplicateIssuer(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "claims.yaml", validPolicyYAML)
+	writeFile(t, dir, "tuples.yaml", validStaticAuthzYAML)
+	t.Setenv("STS_TEST_SIGN_KEY_3", string(testKeyPEM(t)))
+
+	y := baseConfigYAML(dir, "STS_TEST_SIGN_KEY_3")
+	y = strings.Replace(y,
+		"    kind: customer\n",
+		"    kind: customer\n\n  - name: employee-shadow\n    iss: https://auth.example.com\n"+
+			"    jwks: https://auth.example.com/keys\n    audience: [shop-bff]\n    kind: employee\n",
+		1)
+	path := writeFile(t, dir, "config-duplicate-iss.yaml", y)
+
+	_, err := sts.LoadConfig(path)
+	if err == nil {
+		t.Fatal("LoadConfig accepted two issuers sharing one iss; the second would silently replace the first, kind and all")
+	}
+	// The operator has to be able to find BOTH entries, not just the one
+	// that happened to be reported.
+	for _, want := range []string{"issuers[0]", "issuers[1]", "https://auth.example.com"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the duplicate-iss error does not mention %q; error was: %v", want, err)
+		}
 	}
 }
 
@@ -172,6 +226,26 @@ func TestLoadConfigRejectsAnIncompleteConfig(t *testing.T) {
 			return strings.Replace(y,
 				"issuers:\n  - name: customer\n    iss: https://auth.example.com\n    jwks: https://auth.example.com/keys\n    audience: [shop-bff]\n    kind: customer\n",
 				"issuers: []\n", 1)
+		},
+		// An issuer with no audience can never verify a token: every one
+		// of them fails containment against an empty list.
+		"issuer with an empty audience": func(y string) string {
+			return strings.Replace(y, "    audience: [shop-bff]\n", "", 1)
+		},
+		// No clients means every POST /token is denied as an unknown
+		// client — the service binds and serves a JWKS but cannot perform
+		// the one exchange it exists for.
+		"no clients block at all": func(y string) string {
+			return strings.Replace(y,
+				"clients:\n  - id: shop-bff\n    keys:\n      - "+
+					`"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtest\n-----END PUBLIC KEY-----\n"`+"\n",
+				"", 1)
+		},
+		"an empty clients list": func(y string) string {
+			return strings.Replace(y,
+				"clients:\n  - id: shop-bff\n    keys:\n      - "+
+					`"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtest\n-----END PUBLIC KEY-----\n"`+"\n",
+				"clients: []\n", 1)
 		},
 		"instanceAuthorization status neither value": func(y string) string {
 			return strings.Replace(y, "status: absent", "status: sometimes", 1)

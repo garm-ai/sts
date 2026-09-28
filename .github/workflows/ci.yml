@@ -1,0 +1,108 @@
+# CI for sts.
+#
+# Two jobs. The first is the ordinary one — and it runs everything twice,
+# once per build tag set, because exactly one of cmd/sts/authz_static.go and
+# cmd/sts/authz_openfga.go is compiled into any given binary and the
+# production one is the tagged build. An untagged green run proves nothing
+# about it.
+#
+# The second asserts the boundary this repository exists on the far side of.
+# It is asserted rather than documented because a single careless import
+# would end it silently.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      # gofmt first: it is the cheapest check and the one most likely to
+      # fail on a hand-edited file.
+      - run: mise run fmt-check
+
+      # Both tag sets. See mise.toml — each of these tasks runs twice.
+      - run: mise run lint
+      - run: mise run build
+
+      # -race because the JWKS cache and the jti replay map are both shared
+      # across concurrent requests by design, so a data race in either is a
+      # security bug, not a flake.
+      #
+      # Untagged only. -tags openfga additionally compiles
+      # authz_openfga_parity_test.go, which fails outright rather than
+      # skipping when no -openfga-url is given — by design: choosing that
+      # tag is choosing to need a live store, and a parity run with nothing
+      # to check against must not report ok. `mise run lint` still
+      # type-checks that file under the tag; the parity run itself belongs
+      # to a job with a store service, which this workflow does not yet
+      # stand up.
+      - run: mise run test
+
+  boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      # sts must never depend on garmd or devkit.
+      #
+      # This service MINTS identity: it decides what clearance, what
+      # compartments, what verbs and what delegation chain a token carries.
+      # garmd is the daemon that DECIDES WHAT AN IDENTITY MAY DO, and devkit
+      # can assert any identity at all. A minter and an enforcer in one
+      # dependency graph means something in a request path can reach the
+      # other side, and a type shared between them is a definition neither
+      # side can change independently.
+      #
+      # The reciprocal of this check lives in garmd's own CI (its
+      # `boundaries` job greps for garm-ai/(devkit|sts)). It has to be
+      # asserted from BOTH sides: garmd's check cannot see an import that
+      # only exists here.
+      - name: no dependency on the enforcing daemon or the dev minter
+        run: |
+          # BOTH build configurations, because a build tag hides an import
+          # from `go list` completely. cmd/sts/authz_openfga.go and
+          # authz_openfga_parity_test.go are //go:build openfga and an
+          # untagged list does not see either of them at all — and the
+          # tagged build is the production one. The constraint is "not in
+          # go.mod, not in a _test.go import, not behind a build tag", so
+          # the check has to run once per tag set.
+          for tags in "" "openfga"; do
+            # The assignment on its own line is the real protection here: a
+            # `go list` that fails inside an `if` condition is swallowed and
+            # reads as a clean check, where under errexit a failing
+            # assignment aborts the step. The empty-output guard below
+            # covers the remaining case — a `go list` that succeeds but
+            # prints nothing is broken, not clean.
+            deps=$(go list -tags "$tags" -deps -test ./...)
+            if [ -z "$deps" ]; then
+              echo "::error::go list (tags=\"$tags\") produced no dependency output at all; that is a broken check, not a clean one" >&2
+              exit 1
+            fi
+            if echo "$deps" | grep -qE 'garm-ai/(garmd|devkit)'; then
+              echo "::error::sts has acquired a dependency on the enforcing daemon or the dev minter (tags=\"$tags\")" >&2
+              echo "$deps" | grep -E 'garm-ai/(garmd|devkit)' >&2
+              exit 1
+            fi
+          done
+          echo "clean: no garmd and no devkit in the dependency graph, untagged or under -tags openfga"

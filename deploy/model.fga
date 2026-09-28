@@ -1,4 +1,20 @@
-# OpenFGA authorization model backing the three STS gate checks.
+# OpenFGA authorization model backing the three STS gate checks (see
+# sts/authz.go's Authorizer interface and sts/authz_openfga.go).
+#
+# Three relations, one per Authorizer method:
+#   - customer#handled_by  backs HandledBy(employee, customer)
+#   - segment#member       backs InSegment(principal, segment) — the port
+#     receives segment names bare (e.g. "retail-vip"), so the OpenFGA
+#     implementation itself prepends "segment:" before checking membership
+#   - agent#can_invoke     backs CanInvoke(principal, agent)
+#
+# can_invoke is DERIVED, not a flat tuple: an agent is invokable by anyone
+# who is a member of one of its entitled segments. This is deliberately a
+# different encoding of the same fact than the file-backed StaticAuthorizer
+# uses (which stores can_invoke pre-resolved) — see deploy/tuples.openfga.yaml
+# and deploy/tuples.yaml, and authz_openfga_parity_test.go, which proves the two
+# stay in agreement despite the different modelling.
+#
 # Load with: fga model write --store-id <id> --file deploy/model.fga
 model
   schema 1.1
@@ -9,7 +25,6 @@ type customer
     define handled_by: [employee]
 
 type employee
-type runner
 
 type segment
   relations
@@ -17,9 +32,6 @@ type segment
 
 type agent
   relations
-    # entitlement: which segments may invoke this agent (gate 1)
+    # entitlement: which segments may invoke this agent
     define invokable_by: [segment#member]
-    # runnability: which runners may run this agent (gate 3)
-    define runnable_by: [runner]
     define can_invoke: invokable_by
-    define can_run: runnable_by

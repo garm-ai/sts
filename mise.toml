@@ -1,0 +1,54 @@
+# Toolchain and tasks for sts. `mise install` gets you a working checkout;
+# `mise run ci` is exactly what CI runs.
+#
+# Task names match the other garm-ai repositories on purpose: `mise run test`
+# means the same thing everywhere, so moving between repositories costs no
+# relearning.
+
+[tools]
+go = "1.26"
+
+[tasks.build]
+description = "Build every package, both build tag sets"
+# Twice, because a build tag hides a whole file from the compiler. Exactly
+# one of cmd/sts/authz_static.go and cmd/sts/authz_openfga.go is compiled
+# into any given binary, so an untagged build proves nothing about the
+# tagged one — the production binary is the tagged one.
+run = ["go build ./...", "go build -tags openfga ./..."]
+
+[tasks.test]
+description = "Run the tests"
+# -timeout because Go's default is ten minutes, and a test waiting on a
+# service that never answers will sit there for all of it. A CI job that
+# hangs before failing is one nobody waits for.
+#
+# Untagged only: -tags openfga additionally compiles
+# authz_openfga_parity_test.go, which deliberately FAILS rather than skips
+# when no -openfga-url is given (a parity run with no store to check against
+# must not report ok). Running it here needs a live OpenFGA server; the vet
+# task below still type-checks it under both tag sets.
+run = "go test ./... -race -count=1 -timeout 120s"
+
+[tasks.lint]
+description = "Vet the Go, both build tag sets"
+run = ["go vet ./...", "go vet -tags openfga ./..."]
+
+[tasks.fmt]
+description = "Format"
+run = "go fmt ./..."
+
+[tasks."fmt-check"]
+description = "Fail if anything is unformatted"
+# Part of CI because `go vet` does not check formatting.
+run = """
+out=$(gofmt -l .)
+if [ -n "$out" ]; then
+  echo "unformatted — run 'mise run fmt':" >&2
+  echo "$out" >&2
+  exit 1
+fi
+"""
+
+[tasks.ci]
+description = "Everything CI runs"
+depends = ["fmt-check", "lint", "build", "test"]

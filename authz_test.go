@@ -216,4 +216,22 @@ func TestDeployTuplesYAMLExampleLoadsAndAnswersItsDocumentedFacts(t *testing.T) 
 	if ok, err := authz.InSegment(ctx, "customer:C", "retail-vip"); err != nil || !ok {
 		t.Fatalf("InSegment(customer:C, retail-vip) = %v, %v; want true, nil", ok, err)
 	}
+
+	// The delegating path — an employee acting for a customer they handle —
+	// needs more than the handled_by tuple above. exchange.go asks
+	// can_invoke twice there (once for the customer, once for the
+	// employee), and resolves the employee's own claim from their own
+	// segment. Both were missing, which made the shipped handled_by tuple
+	// unreachable: the example could not serve the requested_subject path
+	// the README describes, and the operator saw only an opaque denial.
+	// These two assertions pin the example to serving every path the README
+	// documents, not only the direct one.
+	if ok, err := authz.CanInvoke(ctx, "employee:jdoe", "agent:order-assistant"); err != nil || !ok {
+		t.Fatalf("CanInvoke(employee:jdoe, agent:order-assistant) = %v, %v; want true, nil — "+
+			"without it the shipped handled_by tuple can never be exercised", ok, err)
+	}
+	if ok, err := authz.InSegment(ctx, "employee:jdoe", "support-staff"); err != nil || !ok {
+		t.Fatalf("InSegment(employee:jdoe, support-staff) = %v, %v; want true, nil — "+
+			"a delegating employee in no segment resolves to no roles and is denied", ok, err)
+	}
 }
