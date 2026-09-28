@@ -59,13 +59,11 @@ description = "Install the garm CLI at the pinned version"
 # grant carries and the digest garmd recomputes are one function and not
 # two implementations (approval-grants design, "Decided" item 4).
 #
-# v0.12.0, not the latest real tag (v0.11.0): `claims check` — what the
-# claims-check task below needs — landed after v0.11.0. v0.12.0 does not
-# exist yet; until a release containing `claims check` is tagged, this
-# install step fails with a module-not-found error naming v0.12.0, which is
-# the honest failure — a release is missing, not "unknown command" as if the
-# wiring below were broken.
-run = "go install github.com/garm-ai/garm/cmd/garm@v0.12.0"
+# v0.14.1: the first tag whose `claims check` and `catalogue build` read the
+# bank example as it is laid out today (agent manifests, material fields).
+# Pinned, not latest, so a garm release cannot turn this repository's CI red
+# on its own; bump it deliberately when the bank example moves.
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.14.1"
 
 [tasks."claims-check"]
 description = "Assert deploy/claims.yaml only references what the bank catalogue declares"
