@@ -95,7 +95,7 @@ these is a hard refusal, not a warning:
 | `iss` | the calling client's registered id, e.g. `shop-bff` or `agentd` |
 | `sub` | must equal `iss` exactly |
 | `aud` | must name this service's `tokenEndpointAudience` (see Configuration) |
-| `exp` | required; must not already be past, and must be no further than `JTITTL` (default **5 minutes**) in the future |
+| `exp` | required; must not already be past, and must be no further than **5 minutes** in the future (fixed; there is no config key for it) |
 | `jti` | required; single-use, keyed on **`(client id, jti)`** together, not on the bare `jti` — so two different clients may legitimately reuse the same `jti` value without colliding |
 | signature | must verify against one of that client's currently-registered public keys |
 
@@ -113,7 +113,7 @@ in the meantime.
 |---|---|
 | `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` — **required**; anything else is refused |
 | `client_assertion_type` | optional, as below — a present-but-wrong value is refused rather than ignored |
-| `client_assertion` | the BFF's `private_key_jwt` — see "The client assertion" above |
+| `client_assertion` | **required** — the BFF's `private_key_jwt`, see "The client assertion" above |
 | `subject_token` | the customer or employee token to verify — **required** to select this door (a request carrying this and `on_behalf_of` is refused) |
 | `requested_subject` | a customer identity, e.g. `customer:C-8123` — optional, and meaningful only when the caller verified as an **employee**; must open with `customer:` and have a non-empty remainder (a bare `customer:` is refused) |
 | `agent` | bare agent name, e.g. `order-assistant` — optional, but **at least one of `agent` or `requested_subject` must be present** |
@@ -143,7 +143,7 @@ under it. This is the one shape "the token shape" below does not show.
 |---|---|
 | `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` — **required**; anything else is refused |
 | `client_assertion_type` | `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` — **optional**, but a *different* value is refused rather than ignored (`private_key_jwt` is the only client authentication this service implements, so an absent type is unambiguous; a present one naming something else means the caller and this endpoint have already diverged) |
-| `client_assertion` | the runner's `private_key_jwt` — see "The client assertion" above |
+| `client_assertion` | **required** — the runner's `private_key_jwt`, see "The client assertion" above |
 | `on_behalf_of` | type-prefixed subject, e.g. `employee:jdoe` — **required**, and its prefix must be `customer:` or `employee:` |
 | `subject_kind` | `USER` — **required**; an absent, empty, or any other value is refused ("subject_kind must be USER or SERVICE"). `SERVICE` is a distinct, named refusal from the same check: the value is recognised but has no claims-policy path in this version. |
 | `agent` | bare agent name, e.g. `order-assistant` — **required** |
@@ -173,12 +173,15 @@ Both doors return the same RFC 8693 §2.2.1 shape on success:
 
 `expires_in` reflects `delegationTTL` (600 seconds is the 10-minute
 default). Every failure — from either door — is `400
-{"error":"access_denied"}`, the same opaque body "What is NOT built" and
+{"error":"access_denied"}` (the one exception is a non-`POST`, answered
+`405` with an `Allow` header), the same opaque body "What is NOT built" and
 "Security notes" describe for `/approve`.
 
 ## The token shape
 
-Both doors mint this shape. There is no `scope` claim anywhere in it —
+Both doors mint this shape when an agent is named; the direct door's
+no-agent mode above puts the employee at `act` instead. There is no
+`scope` claim anywhere in it —
 `garm` replaces it entirely — and the only difference between a direct-door
 token and a governed-door one is `exec`, shown here and present **only** on
 the governed door's:
@@ -351,11 +354,11 @@ checked:
 
 | Refusal | Detail |
 |---|---|
-| `Content-Type` is not exactly `application/json` | |
+| the `Content-Type` media type is not `application/json` | parameters such as `; charset=utf-8` are accepted; only the media type is compared |
 | the body exceeds 64 KiB (`maxApproveBody`) | an unauthenticated caller cannot make this service read an unbounded body before anything about it is verified |
 | a duplicate top-level JSON key | one legal object where `encoding/json`'s last-wins decode would approve a different request than a reader sees |
-| more than one JSON value in the body | same reasoning as the unknown-field check below |
 | an unknown JSON field | a misspelled key is a request that silently approves something other than what the caller meant |
+| more than one JSON value in the body | same reasoning as the unknown-field check above |
 | `client_assertion_type` names anything but the one accepted kind | as `POST /token` |
 | `client_assertion` fails authentication | see "The client assertion" above — wrong client, bad signature, expired, or replayed `jti` |
 | no bearer token, or a non-`Bearer` `Authorization` header | the approver's own credential is missing |
