@@ -35,11 +35,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The static, file-backed Authorizer is the only implementation this
-	// task builds; an OpenFGA-backed one is a later task. Choosing which
-	// Authorizer to build is main's job, not Config's — see config.go's
-	// Build doc comment.
-	authz, err := sts.LoadStaticAuthorizer(cfg.StaticAuthzPath)
+	// newAuthorizer picks this BUILD's Authorizer implementation, not a
+	// runtime choice: an untagged binary always uses the static, file-backed
+	// one (cmd/sts/authz_static.go), and a binary built with -tags openfga
+	// always uses the OpenFGA-backed one (cmd/sts/authz_openfga.go). Which
+	// implementation a given `sts` binary has is decided when it is built.
+	authz, err := newAuthorizer(cfg)
 	if err != nil {
 		log.Error("sts: authorizer", "err", err)
 		os.Exit(1)

@@ -64,12 +64,31 @@ type Config struct {
 	// PolicyPath is the claims policy file (see LoadPolicy).
 	PolicyPath string
 	// StaticAuthzPath is the static authorizer tuples file (see
-	// LoadStaticAuthorizer). Config does not load it itself — main chooses
-	// which Authorizer implementation to build (static today; OpenFGA is a
-	// later task) and passes the result to Build.
+	// LoadStaticAuthorizer). Config does not load it itself — which
+	// Authorizer implementation a binary builds is chosen by its build tag,
+	// not at runtime (see cmd/sts/authz_static.go and
+	// cmd/sts/authz_openfga.go), and the result is passed to Build.
 	StaticAuthzPath string
 
+	// OpenFGA carries the OpenFGA store connection details. LoadConfig
+	// always parses these fields, whether or not the running binary can use
+	// them — an untagged build ignores them entirely, and only a binary
+	// built with -tags openfga (cmd/sts/authz_openfga.go) requires ApiURL
+	// and StoreID to be set. See deploy/config.yaml's authz.openfga block.
+	OpenFGA OpenFGAConfig
+
 	InstanceAuthorization InstanceAuthzConfig
+}
+
+// OpenFGAConfig is the connection configuration for the OpenFGA-backed
+// Authorizer (authz_openfga.go, built only under -tags openfga).
+// AuthorizationModelID is optional — leave it empty only for local
+// development; production should pin it, since an unpinned store silently
+// reinterprets every check the moment a new model version is written.
+type OpenFGAConfig struct {
+	ApiURL               string
+	StoreID              string
+	AuthorizationModelID string
 }
 
 // --- on-disk shape -------------------------------------------------------
@@ -91,7 +110,12 @@ type configFile struct {
 
 	Policy string `yaml:"policy"`
 	Authz  struct {
-		Static string `yaml:"static"`
+		Static  string `yaml:"static"`
+		OpenFGA struct {
+			ApiURL               string `yaml:"apiUrl"`
+			StoreID              string `yaml:"storeId"`
+			AuthorizationModelID string `yaml:"modelId"`
+		} `yaml:"openfga"`
 	} `yaml:"authz"`
 
 	InstanceAuthorization struct {
@@ -198,6 +222,11 @@ func LoadConfig(path string) (*Config, error) {
 		TokenEndpointAudience: cf.TokenEndpointAudience,
 		PolicyPath:            cf.Policy,
 		StaticAuthzPath:       cf.Authz.Static,
+		OpenFGA: OpenFGAConfig{
+			ApiURL:               cf.Authz.OpenFGA.ApiURL,
+			StoreID:              cf.Authz.OpenFGA.StoreID,
+			AuthorizationModelID: cf.Authz.OpenFGA.AuthorizationModelID,
+		},
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = defaultListen
@@ -327,9 +356,9 @@ func LoadConfig(path string) (*Config, error) {
 
 // Build wires a loaded Config's pieces — keyring, verifier, claims policy
 // and client registry — into a running Server. authz is supplied by the
-// caller rather than built here, because which Authorizer implementation to
-// use (the static, file-backed one today; OpenFGA in a later task) is a
-// decision main makes, not one this file needs to know about.
+// caller rather than built here, because which Authorizer implementation a
+// binary has is decided by its build tag (see cmd/sts/authz_static.go and
+// cmd/sts/authz_openfga.go), not something this file needs to know about.
 //
 // ctx is accepted for symmetry with the rest of this package's
 // context-aware constructors and to leave room for a future step here that

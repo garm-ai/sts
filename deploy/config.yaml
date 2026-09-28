@@ -52,9 +52,19 @@ policy: ./deploy/claims.yaml
 authz:
   # Flat, file-backed authorizer for development and CI (see
   # deploy/tuples.yaml) — every relation is looked up as an exact tuple, no
-  # graph is resolved. An OpenFGA-backed Authorizer, selected the same way in
-  # cmd/sts/main.go, is a later task; it is not built yet.
+  # graph is resolved. This is the authorizer an UNTAGGED sts build uses
+  # (cmd/sts/authz_static.go).
   static: ./deploy/tuples.yaml
+
+  # The production, OpenFGA-backed authorizer (see deploy/model.fga and
+  # deploy/tuples.openfga.yaml). This whole block applies ONLY to a binary
+  # built with -tags openfga (cmd/sts/authz_openfga.go) — an untagged build
+  # ignores it entirely, and a -tags openfga build fails at startup if
+  # apiUrl or storeId is left unset.
+  # openfga:
+  #   apiUrl: http://localhost:8080        # base URL of the OpenFGA HTTP API
+  #   storeId: 01JXXXXXXXXXXXXXXXXXXXXXXX  # the OpenFGA store holding deploy/tuples.openfga.yaml's tuples
+  #   modelId: 01JYYYYYYYYYYYYYYYYYYYYYYY  # optional; pins Check calls to one model version — recommended for production
 
 # spec §3.5: an ASSERTION this service cannot verify on its own — whether
 # garmd (the daemon that verifies these tokens) actually enforces
