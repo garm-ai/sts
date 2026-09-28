@@ -167,7 +167,16 @@ func resolveSecretEnvRef(field, raw string) (string, error) {
 	}
 	m := envRefPattern.FindStringSubmatch(raw)
 	if m == nil {
-		return "", fmt.Errorf("%s must be an environment variable reference ($NAME or ${NAME}), not inline material; got %q", field, raw)
+		// The rejected value is NOT echoed. This branch's whole purpose is
+		// to catch an operator who pasted a private key into the config
+		// file, so raw is, precisely when this check matters most, the key
+		// itself — and this error is written to stdout by cmd/sts/main.go's
+		// JSON slog handler, which is to say into the logs of a
+		// crash-looping pod and from there into a log aggregator with wider
+		// access and longer retention than the config file ever had. The
+		// length is enough for the operator to recognize which field they
+		// got wrong without reproducing the secret anywhere.
+		return "", fmt.Errorf("%s must be an environment variable reference ($NAME or ${NAME}), not inline material; got a %d-byte literal value", field, len(raw))
 	}
 	name := m[1]
 	val, ok := os.LookupEnv(name)

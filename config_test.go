@@ -127,16 +127,36 @@ func TestLoadConfigRejectsInlineKeyMaterial(t *testing.T) {
 	// A config file that could hold a private key is exactly what this
 	// design refuses to allow: the pem field must be an env-var reference,
 	// never the key itself, even if an operator pastes it in directly.
+	//
+	// The second half of this test is the point of the first: the error
+	// this rejection produces is written to stdout by cmd/sts/main.go, so
+	// it must not carry the material it just refused. The body line is a
+	// distinctive sentinel rather than a plausible-looking key precisely so
+	// the "does not appear in the error" assertion is checking something —
+	// a generic "not-really-a-key" could be absent from the message by
+	// accident.
+	const secretSentinel = "SUPERSECRET-DO-NOT-LOG-a7f3c1e9"
+
 	dir := t.TempDir()
 	writeFile(t, dir, "claims.yaml", validPolicyYAML)
 	writeFile(t, dir, "tuples.yaml", validStaticAuthzYAML)
 
 	cfgYAML := baseConfigYAML(dir, "IRRELEVANT")
-	cfgYAML = strings.Replace(cfgYAML, "pem: $IRRELEVANT", "pem: |\n        -----BEGIN EC PRIVATE KEY-----\n        not-really-a-key\n        -----END EC PRIVATE KEY-----", 1)
+	cfgYAML = strings.Replace(cfgYAML, "pem: $IRRELEVANT", "pem: |\n        -----BEGIN EC PRIVATE KEY-----\n        "+secretSentinel+"\n        -----END EC PRIVATE KEY-----", 1)
 	path := writeFile(t, dir, "config.yaml", cfgYAML)
 
-	if _, err := sts.LoadConfig(path); err == nil {
+	_, err := sts.LoadConfig(path)
+	if err == nil {
 		t.Fatal("LoadConfig accepted inline key material in keys.keys[].pem")
+	}
+	if strings.Contains(err.Error(), secretSentinel) {
+		t.Fatalf("LoadConfig's rejection of inline key material reproduced the key material in its error, "+
+			"which cmd/sts/main.go writes to stdout; error was: %v", err)
+	}
+	// The message still has to be actionable: it must name the field the
+	// operator got wrong, even though it may not quote its value.
+	if !strings.Contains(err.Error(), "keys.keys[0]") {
+		t.Fatalf("LoadConfig's rejection does not name the offending field; error was: %v", err)
 	}
 }
 
