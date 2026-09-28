@@ -1,9 +1,12 @@
 # sts — an RFC 8693 security token service
 
 A small Go service implementing **two** RFC 8693 token exchanges, both
-minting the same short-lived delegation token naming one agent. That token
-carries a `garm` claim — this service's authority claim, not OAuth `scope` —
-which the verifying daemon (`garmd`) uses to decide what the agent may do.
+minting the same short-lived delegation token. Ordinarily that token names
+one agent at `act`; the direct door also has a narrower mode with **no**
+agent at all, for an employee acting directly for a customer (see "The
+direct door's request", below). The token carries a `garm` claim — this
+service's authority claim, not OAuth `scope` — which the verifying daemon
+(`garmd`) uses to decide what whoever is named at `act` may do.
 
 - **The direct door** (exchange 1): a backend-for-frontend (BFF) presents a
   customer or employee token, **verified** against its issuer's JWKS, and
@@ -78,27 +81,100 @@ identity when an asserted one was asked for, or the reverse.
    implementations agreeing — a test asserts the two outputs are identical
    apart from `exec`, `jti`, `iat` and `exp`.
 
+### The client assertion
+
+Both `POST /token` and `POST /approve` authenticate the *calling service*
+(a BFF, the runner, or whichever service is invoking `/approve`) the same
+way: `private_key_jwt` (RFC 7523), checked by `ClientRegistry.Authenticate`
+(`clients.go`) before anything else about the request is trusted. The
+assertion is itself a short-lived JWT the caller signs, and every one of
+these is a hard refusal, not a warning:
+
+| Claim | Requirement |
+|---|---|
+| `iss` | the calling client's registered id, e.g. `shop-bff` or `agentd` |
+| `sub` | must equal `iss` exactly |
+| `aud` | must name this service's `tokenEndpointAudience` (see Configuration) |
+| `exp` | required; must not already be past, and must be no further than `JTITTL` (default **5 minutes**) in the future |
+| `jti` | required; single-use, keyed on **`(client id, jti)`** together, not on the bare `jti` — so two different clients may legitimately reuse the same `jti` value without colliding |
+| signature | must verify against one of that client's currently-registered public keys |
+
+`ClientConfig.PEMs` is a **slice**, not a single key, specifically so a
+client can rotate: register the new key alongside the old one, cut the
+client over to signing with it, then remove the old key in a later
+deploy — an assertion signed by *any* currently-registered key is accepted
+in the meantime.
+
+### The direct door's request
+
+`POST /token`, `application/x-www-form-urlencoded`:
+
+| Field | Value |
+|---|---|
+| `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` — **required**; anything else is refused |
+| `client_assertion_type` | optional, as below — a present-but-wrong value is refused rather than ignored |
+| `client_assertion` | the BFF's `private_key_jwt` — see "The client assertion" above |
+| `subject_token` | the customer or employee token to verify — **required** to select this door (a request carrying this and `on_behalf_of` is refused) |
+| `requested_subject` | a customer identity, e.g. `customer:C-8123` — optional, and meaningful only when the caller verified as an **employee**; must open with `customer:` and have a non-empty remainder (a bare `customer:` is refused) |
+| `agent` | bare agent name, e.g. `order-assistant` — optional, but **at least one of `agent` or `requested_subject` must be present** |
+
+Refusals beyond the field shapes above: the subject token fails JWKS
+verification; its issuer has no usable configured `kind`; its subject
+carries a kind prefix its issuer does not assert; it carries no `tenant`
+claim at all; `requested_subject` is named by a caller who did not verify
+as an employee; `HandledBy` refuses the named employee/customer pair;
+`CanInvoke` refuses the acting principal (asked **twice** when delegating —
+once for the customer, once for the employee — either miss denies); or
+neither `agent` nor `requested_subject` was named, leaving nothing to mint
+at `act`.
+
+**A named `requested_subject` with no `agent`** is a real, supported mode,
+not an oversight: an employee acting *directly* for a customer, with no
+agent in the loop at all. The minted token's `sub` is the customer,
+`act.sub` is the employee, and there is no nested `act.act` — because
+there is no agent to be the current actor and no prior actor to nest
+under it. This is the one shape "the token shape" below does not show.
+
 ### The governed door's request
 
 `POST /token`, `application/x-www-form-urlencoded`:
 
 | Field | Value |
 |---|---|
-| `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` |
+| `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` — **required**; anything else is refused |
 | `client_assertion_type` | `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` — **optional**, but a *different* value is refused rather than ignored (`private_key_jwt` is the only client authentication this service implements, so an absent type is unambiguous; a present one naming something else means the caller and this endpoint have already diverged) |
-| `client_assertion` | the runner's `private_key_jwt`, exactly as the direct door |
+| `client_assertion` | the runner's `private_key_jwt` — see "The client assertion" above |
 | `on_behalf_of` | type-prefixed subject, e.g. `employee:jdoe` — **required**, and its prefix must be `customer:` or `employee:` |
-| `subject_kind` | `USER` (`SERVICE` is refused: it has no claims-policy path in this version) |
+| `subject_kind` | `USER` — **required**; an absent, empty, or any other value is refused ("subject_kind must be USER or SERVICE"). `SERVICE` is a distinct, named refusal from the same check: the value is recognised but has no claims-policy path in this version. |
 | `agent` | bare agent name, e.g. `order-assistant` — **required** |
 | `tenant` | the tenant this run belongs to — **required**, for the same reason the direct door refuses a subject token carrying none |
 
 The runner identity is `runner:<client_id>` taken from the **authenticated**
 client assertion. There is no form field that names it, which is what keeps
 `runner:` out of a caller's control. A presented `act` or `requested_subject`
-is refused rather than ignored — the first because the MVP mints a depth-two
-chain and a runner that was itself delegated has nowhere to go in it, the
-second because `requested_subject` is only ever honoured behind `HandledBy`
-against a verified employee token and this door has no verified anybody.
+is refused rather than ignored — the first because the MVP supports a
+depth-one chain (the subject at `sub`, the agent at `act`) and a runner
+that was itself delegated has nowhere to go in it, the second because
+`requested_subject` is only ever honoured behind `HandledBy` against a
+verified employee token and this door has no verified anybody.
+
+### The response
+
+Both doors return the same RFC 8693 §2.2.1 shape on success:
+
+```json
+{
+  "access_token": "eyJ...",
+  "issued_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "token_type": "Bearer",
+  "expires_in": 600
+}
+```
+
+`expires_in` reflects `delegationTTL` (600 seconds is the 10-minute
+default). Every failure — from either door — is `400
+{"error":"access_denied"}`, the same opaque body "What is NOT built" and
+"Security notes" describe for `/approve`.
 
 ## The token shape
 
@@ -157,9 +233,15 @@ the governed door's:
   `RESTRICTED` (the bare spelling; `garmd` also accepts `CLEARANCE_*`).
   An agent's own authority is minted at `act.garm` **unnarrowed** — this
   service does not intersect the agent's claim against the caller's; that
-  narrowing is `garmd`'s job (spec §2.3), not this one's. The one thing
-  this service *does* refuse to mint is a chain whose verb intersection is
-  empty (a token that would be syntactically valid and useless).
+  narrowing is `garmd`'s job (spec §2.3), not this one's. Several shapes
+  *are* refused before signing, though: a chain whose verb intersection is
+  empty (a token that would be syntactically valid and useless); a
+  principal, an agent, or (when delegating) the acting employee that
+  resolves to no segment roles at all; any resolved claim in the chain
+  surfacing an empty `clearance` (an internal invariant — `garmd`'s
+  `ParseClaims` would refuse such a token anyway); and a customer-kind mint
+  when `instanceAuthorization` is `absent` with no `unconfinedCeiling`
+  configured (see below).
 
 ## `POST /approve` — minting a human's yes
 
@@ -262,6 +344,30 @@ The grant itself:
   approver, and answering `400` to a `GET` would make the endpoint harder
   to operate for nothing.
 
+### What `/approve` refuses
+
+Every row below is one of those opaque `400`s. In the order they are
+checked:
+
+| Refusal | Detail |
+|---|---|
+| `Content-Type` is not exactly `application/json` | |
+| the body exceeds 64 KiB (`maxApproveBody`) | an unauthenticated caller cannot make this service read an unbounded body before anything about it is verified |
+| a duplicate top-level JSON key | one legal object where `encoding/json`'s last-wins decode would approve a different request than a reader sees |
+| more than one JSON value in the body | same reasoning as the unknown-field check below |
+| an unknown JSON field | a misspelled key is a request that silently approves something other than what the caller meant |
+| `client_assertion_type` names anything but the one accepted kind | as `POST /token` |
+| `client_assertion` fails authentication | see "The client assertion" above — wrong client, bad signature, expired, or replayed `jti` |
+| no bearer token, or a non-`Bearer` `Authorization` header | the approver's own credential is missing |
+| the approver's bearer token fails JWKS verification | |
+| the approver token carries an `act` claim | the *key*, not its value — a delegated identity cannot approve |
+| the approver's issuer is not configured `kind: employee` | a customer cannot approve |
+| the approver's subject carries a kind prefix its issuer does not assert | the same doubling rule `identityForKind` enforces on the direct door |
+| the approver's token asserts no usable `garm` authority | nothing to record |
+| `tool` is not a well-formed FQN (`pkg.name`) | shape-only; this service holds no catalogue |
+| `subject` is not type-prefixed | e.g. `customer:C-8123` |
+| a `material` path is rejected by `grant.ValidPath` | would forge a separator in the digest |
+
 ## What is NOT built
 
 - **A runner.** This service mints *for* one (exchange 2 above, gated on a
@@ -300,7 +406,9 @@ The grant itself:
   two, and which one a binary has is fixed when it is built, not at
   runtime. An **untagged** build uses `LoadStaticAuthorizer`
   (`authz_static.go`): a flat YAML file of already-resolved tuples (see
-  `deploy/tuples.yaml`) — it resolves no graph, so a segment granting an
+  `deploy/tuples.yaml`, whose four top-level keys — `can_invoke`,
+  `handled_by`, `in_segment`, `can_run` — name the `Authorizer` interface's
+  four methods directly) — it resolves no graph, so a segment granting an
   agent entitlement is not followed transitively; every relation must be
   written in its already-resolved form. That is the dev/CI authorizer. A
   build with **`-tags openfga`** uses the OpenFGA-backed one
@@ -348,7 +456,8 @@ for a complete, loadable example) and validates it eagerly — every check
 below is a hard failure at startup with a message naming the field, not a
 mysterious failure discovered at the first request:
 
-- `issuer`, `audience`, `tokenEndpointAudience`, `listen`
+- `issuer`, `audience`, `tokenEndpointAudience`, `listen` (defaults to
+  `:8080` if omitted)
 
   > **`audience` must match garmd's `--audience`.** This service ships
   > `audience: garm://garmd`, and `garmd`'s `--audience` flag **defaults to
@@ -359,36 +468,56 @@ mysterious failure discovered at the first request:
   > this service's `audience` is set to. The value here is deliberately not
   > changed to garmd's default: `garm://garmd` is the more correct
   > identifier, and garmd's audience is explicitly configurable.
+  >
+  > **`tokenEndpointAudience` is a *different* audience**, easily confused
+  > with the one above: it is the `aud` a `client_assertion` must carry to
+  > authenticate to *this* service's own `POST /token` and `POST /approve`
+  > (see "The client assertion"), whereas `audience` is what this service
+  > mints into every *delegation token it issues*, for `garmd` to check.
+  > One is who is allowed to call this service; the other is who this
+  > service's own tokens are for. Confuse them and a BFF's otherwise
+  > correct client assertion is refused as carrying the wrong audience.
 - `delegationTTL` — how long a minted **delegation token** (`POST /token`,
   either door) is valid, as a Go duration string (`10m`). Omitted or `0`, it
   is `NewServer`'s own default (10 minutes) rather than a second default
   living here, for the same reason `approve.ttl_seconds` isn't defaulted in
   `LoadConfig` either. It bounds a different thing than `approve.ttl_seconds`
   below: a delegation token is a session, a grant is a decision, and the two
-  are not meant to expire on the same schedule.
+  are not meant to expire on the same schedule. Unlike `approve.ttl_seconds`
+  below, a **negative** value is not rejected at startup — `LoadConfig`
+  only checks that the string parses as a duration — it is silently
+  replaced by the same 10-minute default at `NewServer`'s `<= 0` check, so a
+  misconfigured `-10m` behaves exactly like an omitted key, with no
+  diagnostic naming the mistake.
 - `keys.active` and `keys.keys[]` — at least one signing key; `active` must
   name one of them. **Signing keys are never inlined.** Each key's `pem`
   field is a reference to an environment variable (`$NAME` or `${NAME}`)
   holding the PEM-encoded ECDSA P-256 private key — `LoadConfig` rejects
   literal key material in this field outright. Retired keys can stay listed
   (served for verification, never signed with) during rotation.
-- `issuers[]` — at least one trusted upstream issuer, each with a non-empty
-  `audience` and a `kind` of `customer` or `employee`. Two entries may not
-  share an `iss`: the verifier keys on it, so a duplicate would silently
-  keep only the last entry's `kind` — and `kind` decides whether
+- `issuers[]` — at least one trusted upstream issuer, each requiring a
+  non-empty `name` (a label, used only in error messages), `iss`, `jwks`
+  (the JWKS URL `Verifier` fetches from), a non-empty `audience`, and a
+  `kind` of `customer` or `employee`. Two entries may not share an `iss`:
+  the verifier keys on it, so a duplicate would silently keep only the
+  last entry's `kind` — and `kind` decides whether
   `instanceAuthorization`'s clearance cap applies.
 - `clients[]` — at least one service allowed to authenticate with
   `private_key_jwt` to **both** `POST /token` and `POST /approve` — a BFF,
   and/or the agent runner (`deploy/config.yaml` registers `agentd`, the
   runner, alongside `shop-bff`, the BFF). Client keys are *public* keys,
-  not secrets, so they may be a file path or inlined PEM directly. A
-  client's id matters beyond authentication: it is what makes the
+  not secrets, so they may be a file path or inlined PEM directly, and each
+  client may register **more than one** (`ClientConfig.PEMs` is a slice) —
+  see "The client assertion" above for why: it is what rotation looks like.
+  A client's id matters beyond authentication: it is what makes the
   `runner:<id>` identity the governed door's `CanRun` is asked about
   (`"runner:" + the AUTHENTICATED client id`, never a field a caller
-  supplies — see `deploy/tuples.yaml`'s `can_run` tuple). A config with no
-  clients would serve a JWKS and deny every `POST /token` and
-  `POST /approve` as an unknown client, so an empty list is a startup
-  failure.
+  supplies — see `deploy/tuples.yaml`'s `can_run` tuples: this repository's
+  own example ships **two**, one for `agentd`, the real runner, and one for
+  `conformance-client`, the id garmd's identity-conformance job
+  authenticates with). A config with no clients would serve a JWKS and
+  deny every `POST /token` and `POST /approve` as an unknown client, so an
+  empty list is a startup failure.
 - `policy` — path to the claims policy file (`LoadPolicy`, `claims.go`).
 - `authz.static` — path to the static authorizer tuples file
   (`LoadStaticAuthorizer`, `authz_static.go`). Used by an **untagged**
@@ -412,7 +541,11 @@ mysterious failure discovered at the first request:
   config that omits the key and a `Server` built directly in Go cannot
   disagree about it. This is only ever a floor on staleness: a tool's own
   `max_grant_age_seconds` is a ceiling `POST /approve` cannot raise, so a
-  generous value here still yields whatever a stricter tool asks for.
+  generous value here still yields whatever a stricter tool asks for. A
+  **negative** value is, unlike a negative `delegationTTL` above, a
+  **startup failure**: `LoadConfig` rejects it outright — a grant that
+  expires before it is minted is refused by every verifier that sees it —
+  rather than silently falling back to the default.
 
 `(*Config).Build(ctx, authz)` wires a loaded `Config` into a running
 `*Server`. It takes the `Authorizer` as a parameter rather than building one
@@ -469,6 +602,36 @@ legitimate place to terminate it.
 Shutdown is signal-aware (`SIGINT`/`SIGTERM`) and graceful, with a 5 second
 timeout for in-flight requests to finish.
 
+## The metadata document
+
+`GET /.well-known/oauth-authorization-server` (`metadata.go`), unauthenticated
+by design — everything in it is already discoverable by anyone who can
+obtain one token, and a verifier has to read it *before* it holds any
+credential of its own. It follows RFC 8414 where RFC 8414 has a field for
+what's meant, plus two extensions this service's one downstream needs:
+
+| Field | Value |
+|---|---|
+| `issuer` | `cfg.Issuer`, verbatim |
+| `jwks_uri` | `<issuer>/.well-known/jwks.json` |
+| `token_endpoint` | `<issuer>/token` |
+| `grant_types_supported` | `["urn:ietf:params:oauth:grant-type:token-exchange"]` |
+| `token_endpoint_auth_signing_alg_values_supported` | `["ES256"]` |
+| `garm_audience` | `cfg.Audience` — the field a verifier actually has to agree with; RFC 8414 has no field for the audience an authorization server *mints* |
+| `garm_approve_endpoint` | `<issuer>/approve` — RFC 8414 has no field for a second, non-OAuth endpoint either |
+
+**The trap:** `cmd/sts/main.go` builds every URL above by
+string-concatenating `cfg.Issuer` with a path
+(`cfg.Issuer+"/.well-known/jwks.json"`, and so on) — there is no separate
+"public base URL" setting. `issuer` therefore has to be the actual,
+externally reachable base URL this service is served at, not merely a
+stable *identifier*. An `issuer` that is a fine identity but unreachable
+from outside (a cluster-internal DNS name, say, when the service is
+actually fronted by a different public hostname) makes this document
+advertise a `jwks_uri` and `token_endpoint` that nothing outside the
+cluster can fetch — and it will look, to whoever reads it, exactly like a
+correctly-configured document, because nothing here checks reachability.
+
 ## Repository layout
 
 | File | What it is |
@@ -482,6 +645,7 @@ timeout for in-flight requests to finish.
 | `clients.go` | `private_key_jwt` client authentication + replay protection |
 | `exchange.go` | The `POST /token` handler: both doors, in order, and the one minting path they share |
 | `approve.go` | The `POST /approve` handler: mints the grant that records a human's yes |
+| `metadata.go` | Serves the discovery document at `/.well-known/oauth-authorization-server` |
 | `config.go` | Loads and validates `deploy/config.yaml`'s shape, wires a `Server` |
 | `cmd/sts/main.go` | The binary: flags, logging, TLS, graceful shutdown |
 | `cmd/sts/authz_static.go`, `cmd/sts/authz_openfga.go` | Which `Authorizer` this build gets — mutually exclusive build tags |
