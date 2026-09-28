@@ -195,6 +195,23 @@ type actClaimJSON struct {
 	Act     *actClaimJSON `json:"act,omitempty"`
 }
 
+// execClaimJSON is provenance, and deliberately not authority.
+//
+// sts-design §4.1: a runner placed in the `act` chain must either assert a
+// garm claim it has no business asserting, or carry an all-permissive one
+// that contributes no narrowing — which reads as authority to everyone who
+// later looks at a token or a ledger row, and which a typo turns real. So
+// the runner is recorded here instead: a top-level claim, outside the act
+// chain, that authn.Fold never touches.
+//
+// Two fields, no more. garmd refuses an exec that is present but is not an
+// object with a non-empty sub (program plan §3.8), and a third field here
+// would be authority nobody agreed to carry.
+type execClaimJSON struct {
+	Subject string `json:"sub"`
+	Issuer  string `json:"iss"`
+}
+
 // mintedToken is the exact shape spec §1.2 mints. There is no `scope` claim
 // anywhere in this type: the `garm` claim replaces it entirely.
 type mintedToken struct {
@@ -207,6 +224,12 @@ type mintedToken struct {
 	Tenant    string        `json:"tenant"`
 	Garm      garmClaimJSON `json:"garm"`
 	Act       actClaimJSON  `json:"act"`
+
+	// Exec is a POINTER with omitempty so exchange 1 emits no `exec` key at
+	// all — not a null, not an empty object. "Was this token obtained by a
+	// runner" must be answerable from the token's shape, and an always-
+	// present key whose contents happen to be blank does not answer it.
+	Exec *execClaimJSON `json:"exec,omitempty"`
 }
 
 // tokenResponse is the RFC 8693 §2.2.1 success response.
@@ -242,18 +265,45 @@ func (s *Server) serveToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req := exchangeRequest{
-		grantType:        r.FormValue("grant_type"),
-		clientAssertion:  r.FormValue("client_assertion"),
-		subjectToken:     r.FormValue("subject_token"),
-		requestedSubject: r.FormValue("requested_subject"),
-		agent:            r.FormValue("agent"),
-	}
+	// Which door. subject_token selects exchange 1; on_behalf_of selects
+	// exchange 2 (program plan §3.9: "subject_token must be absent — its
+	// presence selects exchange 1"). Both present is ambiguous, and picking
+	// one would mint a token the caller did not ask for, so it refuses.
+	subjectToken := r.FormValue("subject_token")
+	onBehalfOf := r.FormValue("on_behalf_of")
 
-	tok, ttl, err := s.exchange(r.Context(), req)
+	var (
+		tok string
+		ttl time.Duration
+		err error
+	)
+	switch {
+	case subjectToken != "" && onBehalfOf != "":
+		s.deny(r.Context(), "request carries both subject_token and on_behalf_of; there is no exchange that means both")
+		s.writeDenied(w)
+		return
+	case onBehalfOf != "":
+		tok, ttl, err = s.exchange2(r.Context(), exchange2Request{
+			grantType:       r.FormValue("grant_type"),
+			clientAssertion: r.FormValue("client_assertion"),
+			onBehalfOf:      onBehalfOf,
+			subjectKind:     r.FormValue("subject_kind"),
+			agent:           r.FormValue("agent"),
+			tenant:          r.FormValue("tenant"),
+			presentedAct:    r.Form["act"],
+		})
+	default:
+		tok, ttl, err = s.exchange(r.Context(), exchangeRequest{
+			grantType:        r.FormValue("grant_type"),
+			clientAssertion:  r.FormValue("client_assertion"),
+			subjectToken:     subjectToken,
+			requestedSubject: r.FormValue("requested_subject"),
+			agent:            r.FormValue("agent"),
+		})
+	}
 	if err != nil {
 		// Every failure reason was already logged at its own call site
-		// inside exchange(); here there is exactly one response, always.
+		// inside the exchange; here there is exactly one response, always.
 		s.writeDenied(w)
 		return
 	}
@@ -289,6 +339,229 @@ type exchangeRequest struct {
 	agent            string // bare agent name, e.g. "order-assistant"
 }
 
+// identityForKind builds the type-prefixed identity for a VERIFIED subject.
+//
+// An IdP may hand back a bare subject ("jdoe") or one that already carries
+// its kind ("employee:jdoe") — devkit's personas do the latter, and both are
+// legitimate. Prefixing unconditionally produced "employee:employee:jdoe",
+// which no tuple names; every authorizer lookup for it misses, and a miss
+// here is indistinguishable from an ordinary, correct-looking denial (see
+// authz.go's identity convention comment, which is about exactly this class
+// of silent failure).
+//
+// A subject carrying a DIFFERENT kind's prefix than its issuer's configured
+// kind is REFUSED rather than repaired. TrustedIssuer.Kind is the authority
+// on what an issuer's tokens mean; a token from the employee IdP whose sub
+// says "customer:" is either a misconfigured issuer or a subject claim
+// chosen to look like one, and both deserve to be seen rather than turned
+// into "employee:customer:C-1".
+func identityForKind(kind, subject string) (string, bool) {
+	for _, known := range []string{"customer", "employee"} {
+		rest, ok := strings.CutPrefix(subject, known+":")
+		if !ok {
+			continue
+		}
+		// The prefix is one this service recognises, so it MEANS the kind
+		// it spells. It must agree with the issuer's, and it must name
+		// somebody.
+		if known != kind || rest == "" {
+			return "", false
+		}
+		return subject, true
+	}
+	if subject == "" {
+		// Unreachable: parseUpstreamClaims already refuses a token with no
+		// sub. Refused here rather than assumed, so a later change there
+		// cannot quietly mint "employee:".
+		return "", false
+	}
+	return kind + ":" + subject, true
+}
+
+// exchange2Request is the parsed form body of the GOVERNED door's POST
+// /token (program plan §3.9).
+//
+// It carries no subject token, and that is the whole difference. Exchange 1
+// VERIFIES who the subject is against an IdP's JWKS. Here the runner
+// ASSERTS it, and the only reason that is acceptable is CanRun: a written
+// tuple saying this runner may execute this agent at all. Remove that check
+// and on_behalf_of becomes an impersonation field.
+type exchange2Request struct {
+	grantType       string
+	clientAssertion string
+	onBehalfOf      string   // type-prefixed, e.g. "employee:jdoe"
+	subjectKind     string   // "USER" or "SERVICE", from InvocationContext.principal.kind
+	agent           string   // bare agent name, e.g. "support-assistant"
+	tenant          string   // from InvocationContext.attribution.tenant (C-1)
+	presentedAct    []string // every `act` form value the caller sent, refused below
+}
+
+// segmentKindFromIdentity reads the claims-policy segment kind off a
+// type-prefixed identity.
+//
+// It is the one place the governed door learns whether it is minting for a
+// customer or an employee: there is no verified token to read a
+// TrustedIssuer.Kind from, so the prefix the runner presents decides — and
+// it decides into a CLOSED set, so an unrecognised prefix (or a bare
+// "jdoe") is a refusal rather than a kind that silently matches no segment
+// and reads back as an ordinary denial.
+func segmentKindFromIdentity(identity string) (string, bool) {
+	for _, kind := range []string{"customer", "employee"} {
+		rest, ok := strings.CutPrefix(identity, kind+":")
+		if !ok || rest == "" {
+			continue
+		}
+		// A remainder that itself carries a kind prefix — "employee:
+		// employee:jdoe", or "employee:customer:C-1" — is the doubled
+		// identity program plan §7 item 10 describes, arriving from a
+		// runner rather than from an IdP. Refused for the reason
+		// identityForKind refuses it: no tuple names it, and choosing
+		// which half the caller meant is not this service's call.
+		if _, doubled := segmentKindFromIdentity(rest); doubled {
+			return "", false
+		}
+		return kind, true
+	}
+	return "", false
+}
+
+// exchange2 is the governed door (program plan §3.9). The order below is
+// fixed: authentication, then CanRun, then CanInvoke, then claims. CanRun
+// comes first among the authorization checks because on_behalf_of is
+// asserted rather than verified — asking CanInvoke of an unauthorised
+// runner's chosen subject would turn this endpoint into an entitlement
+// oracle for anyone who can reach it.
+func (s *Server) exchange2(ctx context.Context, req exchange2Request) (string, time.Duration, error) {
+	if req.grantType != grantTypeTokenExchange {
+		s.deny(ctx, "unsupported grant_type", "grant_type", req.grantType)
+		return "", 0, errDenied
+	}
+
+	// A presented act chain is refused outright: the MVP supports a
+	// depth-one chain (human at sub, agent at act) and a runner that was
+	// itself delegated has nowhere to go in it. An empty `act=` is not a
+	// delegated caller, so only a non-empty value refuses.
+	for _, v := range req.presentedAct {
+		if v != "" {
+			s.deny(ctx, "governed door presented an act chain; the MVP supports a depth-one chain only", "act", v)
+			return "", 0, errDenied
+		}
+	}
+
+	// Step 1: client assertion + jti replay, exactly as exchange 1. The
+	// AUTHENTICATED client id is the runner identity — there is no second
+	// credential naming it and no form field a caller could set, which is
+	// what keeps "runner:" out of the caller's control.
+	clientID, err := s.clients.Authenticate(req.clientAssertion)
+	if err != nil {
+		s.deny(ctx, "client authentication failed", "err", err)
+		return "", 0, errDenied
+	}
+	runnerIdentity := "runner:" + clientID
+
+	if req.agent == "" {
+		s.deny(ctx, "governed door names no agent", "client", clientID)
+		return "", 0, errDenied
+	}
+	agentIdentity := "agent:" + req.agent
+
+	subKind, ok := segmentKindFromIdentity(req.onBehalfOf)
+	if !ok {
+		s.deny(ctx, "on_behalf_of is not a type-prefixed customer or employee identity",
+			"client", clientID, "on_behalf_of", req.onBehalfOf)
+		return "", 0, errDenied
+	}
+
+	switch req.subjectKind {
+	case "USER":
+		// The only kind the claims policy can resolve: ForSegments always
+		// mints Kind "USER" (claims.go), and both customers and employees
+		// are users to garm.
+	case "SERVICE":
+		s.deny(ctx, "subject_kind SERVICE has no claims-policy path in this version",
+			"client", clientID, "on_behalf_of", req.onBehalfOf)
+		return "", 0, errDenied
+	default:
+		s.deny(ctx, "subject_kind must be USER or SERVICE", "client", clientID, "subject_kind", req.subjectKind)
+		return "", 0, errDenied
+	}
+
+	// tenant is REQUIRED here for the same reason exchange 1 refuses a
+	// subject token that carries none: confinement to a tenant's own data
+	// depends on it, so minting "" is a confinement failure rather than a
+	// cosmetic gap. See this plan's C-1.
+	if req.tenant == "" {
+		s.deny(ctx, "governed door names no tenant", "client", clientID, "on_behalf_of", req.onBehalfOf)
+		return "", 0, errDenied
+	}
+
+	// Step 2 (program plan §3.9): may this runner execute this agent?
+	ok, err = s.authz.CanRun(ctx, runnerIdentity, agentIdentity)
+	if err != nil {
+		s.deny(ctx, "can_run check failed", "runner", runnerIdentity, "agent", agentIdentity, "err", err)
+		return "", 0, errDenied
+	}
+	if !ok {
+		s.deny(ctx, "runner may not execute agent", "runner", runnerIdentity, "agent", agentIdentity)
+		return "", 0, errDenied
+	}
+
+	// Step 3: can_invoke, the same question exchange 1 asks, asked of the
+	// subject the runner named.
+	ok, err = s.authz.CanInvoke(ctx, req.onBehalfOf, agentIdentity)
+	if err != nil {
+		s.deny(ctx, "can_invoke check failed", "principal", req.onBehalfOf, "agent", agentIdentity, "err", err)
+		return "", 0, errDenied
+	}
+	if !ok {
+		s.deny(ctx, "principal may not invoke agent", "principal", req.onBehalfOf, "agent", agentIdentity)
+		return "", 0, errDenied
+	}
+
+	// It never trusts a garm claim the runner presents: there is no field
+	// here to present one in, and the chain below is rebuilt from the claims
+	// policy exactly as exchange 1 would build it (spec §3.3 item 4).
+	return s.resolveAndMint(ctx, mintInputs{
+		subIdentity: req.onBehalfOf,
+		subKind:     subKind,
+		tenant:      req.tenant,
+		agent:       req.agent,
+		exec:        &execClaimJSON{Subject: runnerIdentity, Issuer: s.issuer},
+	})
+}
+
+// mintInputs is everything the claims half of an exchange has resolved to,
+// whichever door produced it.
+//
+// It exists so there is exactly ONE minting path. Two doors with two mint
+// implementations is two places the claims policy, the §3.5 clearance gate
+// and the §2.4 refusals have to stay in agreement, and the only way to find
+// out they had stopped would be a token in production that garmd folds
+// differently than anyone expected.
+type mintInputs struct {
+	// subIdentity is the type-prefixed subject: "customer:C-8123".
+	subIdentity string
+
+	// subKind is the CLAIMS-POLICY segment kind, "customer" or "employee" —
+	// not garm's PrincipalKind vocabulary, which is always USER for a
+	// segment-resolved claim (claims.go's validSegmentKinds).
+	subKind string
+
+	tenant string
+
+	// agent is the BARE agent name; "" when the acting employee themself
+	// occupies act.
+	agent string
+
+	// employeeIdentity is the acting employee, type-prefixed; "" unless
+	// delegating.
+	employeeIdentity string
+	delegating       bool
+
+	// exec is the provenance claim, nil on exchange 1.
+	exec *execClaimJSON
+}
+
 // exchange runs the whole pipeline and returns a signed token, or an error
 // whose text is never shown to the caller (every reason was already logged
 // at its call site via s.deny).
@@ -322,7 +595,12 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 		s.deny(ctx, "issuer has no usable kind", "client", clientID, "issuer", trusted.Issuer, "kind", callerKind)
 		return "", 0, errDenied
 	}
-	callerIdentity := callerKind + ":" + upstream.Subject
+	callerIdentity, ok := identityForKind(callerKind, upstream.Subject)
+	if !ok {
+		s.deny(ctx, "subject carries a kind prefix its issuer does not assert",
+			"client", clientID, "issuer", trusted.Issuer, "kind", callerKind)
+		return "", 0, errDenied
+	}
 
 	// tenant is REQUIRED, not merely propagated: confinement to a tenant's
 	// own data depends on it flowing from the verified token, so a token
@@ -369,22 +647,19 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 
 	// --- authorization ----------------------------------------------------
 
-	var agentIdentity string
+	// Step 5: can_invoke, twice when delegating (spec §3.3) — the customer's
+	// entitlement and the employee's are different questions, and either one
+	// failing must deny. Only asked when an agent is actually being minted.
 	mintingForAgent := req.agent != ""
-	if mintingForAgent {
-		agentIdentity = "agent:" + req.agent
-	} else if !delegating {
+	if !mintingForAgent && !delegating {
 		// Neither a named agent nor a delegated customer to act for: there
 		// is nothing to put at `act`, and every token this service mints
 		// carries one. Refuse rather than guess.
 		s.deny(ctx, "request names neither an agent nor a requested_subject", "client", clientID)
 		return "", 0, errDenied
 	}
-
-	// Step 5: can_invoke, twice when delegating (spec §3.3) — the customer's
-	// entitlement and the employee's are different questions, and either one
-	// failing must deny. Only asked when an agent is actually being minted.
 	if mintingForAgent {
+		agentIdentity := "agent:" + req.agent
 		ok, err := s.authz.CanInvoke(ctx, subIdentity, agentIdentity)
 		if err != nil {
 			s.deny(ctx, "can_invoke check failed", "principal", subIdentity, "agent", agentIdentity, "err", err)
@@ -407,26 +682,40 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 		}
 	}
 
+	// Steps 6 and 7, the §2.4 refusals, the §3.5 gate and the signature are
+	// the same for both doors, so they live in one place.
+	return s.resolveAndMint(ctx, mintInputs{
+		subIdentity:      subIdentity,
+		subKind:          subKind,
+		tenant:           tenant,
+		agent:            req.agent,
+		employeeIdentity: employeeIdentity,
+		delegating:       delegating,
+	})
+}
+
+// resolveAndMint runs steps 6 and 7, the spec §2.4 refusals, the §3.5
+// instance-authorization gate and the signature. Both doors end here.
+func (s *Server) resolveAndMint(ctx context.Context, in mintInputs) (string, time.Duration, error) {
+	mintingForAgent := in.agent != ""
+
 	// Step 6: segment membership, feeding step 7's claims resolution.
-	subClaim, err := s.resolveSegmentClaim(ctx, subIdentity, subKind)
+	subClaim, err := s.resolveSegmentClaim(ctx, in.subIdentity, in.subKind)
 	if err != nil {
-		s.deny(ctx, "sub principal resolves to no roles", "principal", subIdentity, "kind", subKind, "err", err)
+		s.deny(ctx, "sub principal resolves to no roles", "principal", in.subIdentity, "kind", in.subKind, "err", err)
 		return "", 0, errDenied
 	}
 
 	// The employee's OWN claim is resolved whenever delegating, whether or
-	// not an agent is also named. This is the gate the direct path already
-	// enforces via subClaim above (TestExchangeRefusesAPrincipalWithNoRoles)
-	// and the delegating path must enforce identically: an employee in no
-	// segment has no authority to assert, agent or no agent, and skipping
-	// this resolution was a real hole — the customer's full, unnarrowed
-	// authority would otherwise mint for staff with no entitlement of their
-	// own at all.
+	// not an agent is also named. An employee in no segment has no authority
+	// to assert, agent or no agent, and skipping this resolution was a real
+	// hole — the customer's full, unnarrowed authority would otherwise mint
+	// for staff with no entitlement of their own at all.
 	var employeeClaim *GarmClaim
-	if delegating {
-		employeeClaim, err = s.resolveSegmentClaim(ctx, employeeIdentity, "employee")
+	if in.delegating {
+		employeeClaim, err = s.resolveSegmentClaim(ctx, in.employeeIdentity, "employee")
 		if err != nil {
-			s.deny(ctx, "acting employee resolves to no roles", "employee", employeeIdentity, "err", err)
+			s.deny(ctx, "acting employee resolves to no roles", "employee", in.employeeIdentity, "err", err)
 			return "", 0, errDenied
 		}
 	}
@@ -436,35 +725,34 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 	// against sub) happens in garmd, not this service (spec §2.3).
 	var actClaim *GarmClaim
 	if mintingForAgent {
-		actClaim, err = s.policy.ForAgent(req.agent)
+		actClaim, err = s.policy.ForAgent(in.agent)
 		if err != nil {
-			s.deny(ctx, "agent resolves to no roles", "agent", req.agent, "err", err)
+			s.deny(ctx, "agent resolves to no roles", "agent", in.agent, "err", err)
 			return "", 0, errDenied
 		}
 	} else {
-		// delegating with no agent named: the employee themself occupies
-		// `act`, exercising the customer's authority directly.
 		actClaim = employeeClaim
 	}
 
 	// --- refusals (spec §2.4) and the instance-authorization gate (§3.5) --
-
-	if subKind == "customer" {
+	//
+	// This runs for BOTH doors. The governed door reaching a customer
+	// subject without passing through here would be a way to obtain an
+	// uncapped customer token by asking a runner for it, which is exactly
+	// the hole the gate exists to close.
+	if in.subKind == "customer" {
 		capped, wasCapped, err := s.applyInstanceAuthorization(subClaim.Clearance)
 		if err != nil {
 			s.deny(ctx, "instance authorization refuses customer mint",
-				"principal", subIdentity, "status", s.instance.Status)
+				"principal", in.subIdentity, "status", s.instance.Status)
 			return "", 0, errDenied
 		}
 		if wasCapped {
 			s.log.Warn("sts: exchange: customer clearance capped by instanceAuthorization.unconfinedCeiling",
-				"principal", subIdentity, "granted", subClaim.Clearance, "ceiling", s.instance.UnconfinedCeiling, "effective", capped)
+				"principal", in.subIdentity, "granted", subClaim.Clearance, "ceiling", s.instance.UnconfinedCeiling, "effective", capped)
 		} else if s.instance.Status == "absent" {
-			// Logged on EVERY exchange under this configuration, capped or
-			// not: a cap that only logs when it bites reads, on the quiet
-			// calls, as if no cap exists at all.
 			s.log.Info("sts: exchange: customer mint under instanceAuthorization: absent with a ceiling; no reduction was needed",
-				"principal", subIdentity, "granted", subClaim.Clearance, "ceiling", s.instance.UnconfinedCeiling)
+				"principal", in.subIdentity, "granted", subClaim.Clearance, "ceiling", s.instance.UnconfinedCeiling)
 		}
 		subClaim = &GarmClaim{
 			Clearance:    capped,
@@ -477,34 +765,20 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 
 	// chain is every level this exchange is about to mint — 2 levels
 	// ordinarily, 3 when delegating to a named agent (sub, agent, employee).
-	// Both refusals below walk it in full, not a hand-unrolled sub/act pair,
-	// so a third (or later, deeper) level is covered automatically rather
-	// than silently falling outside the check.
+	// The runner is NOT in it: exec is provenance and is never folded.
 	chain := []*GarmClaim{subClaim, actClaim}
-	if mintingForAgent && delegating {
+	if mintingForAgent && in.delegating {
 		chain = append(chain, employeeClaim)
 	}
 
-	// spec §2.4 refuses an empty VERB intersection over the chain — a token
-	// that would be syntactically valid and useless. It deliberately does
-	// NOT refuse an empty compartment intersection: garmd's CompartmentSet
-	// covers `need &^ held == 0`, so an empty held set means "no
-	// compartments held" (fail-safe) and is never read as "unrestricted",
-	// and a tool may legitimately require none. This fixture's own
-	// happy-path chain folds to zero compartments in common, which is
-	// correct and expected, not a gap.
 	if len(intersectAllVerbs(chain)) == 0 {
-		s.deny(ctx, "verb intersection over the chain is empty", "principal", subIdentity)
+		s.deny(ctx, "verb intersection over the chain is empty", "principal", in.subIdentity)
 		return "", 0, errDenied
 	}
 
 	// The invariant the whole design rests on: every level MUST carry a
 	// non-empty garm.clearance, or garmd's ParseClaims refuses the whole
-	// token. ForSegments/ForAgent already guarantee this, but a mint-time
-	// assertion here is cheap defense in depth for the one property that
-	// turns a single miss into a total outage. Walking chain, rather than
-	// naming subClaim/actClaim directly, means this keeps covering every
-	// level even as the chain grows a third one.
+	// token.
 	for _, c := range chain {
 		if c.Clearance == "" {
 			s.deny(ctx, "internal: a resolved claim in the chain has an empty clearance")
@@ -523,21 +797,21 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 	now := time.Now().UTC()
 	exp := now.Add(s.ttl)
 
-	actSubject := agentIdentity
+	actSubject := "agent:" + in.agent
 	if !mintingForAgent {
-		actSubject = employeeIdentity
+		actSubject = in.employeeIdentity
 	}
 
 	act := actClaimJSON{
 		Subject: actSubject,
 		Garm:    toGarmClaimJSON(actClaim),
 	}
-	if mintingForAgent && delegating {
+	if mintingForAgent && in.delegating {
 		// customer (sub) -> agent (act) -> employee (act.act): the agent is
 		// the current actor and sits outermost; the employee, who acted
 		// earlier to obtain this token, nests inside it (RFC 8693 §4.1).
 		act.Act = &actClaimJSON{
-			Subject: employeeIdentity,
+			Subject: in.employeeIdentity,
 			Garm:    toGarmClaimJSON(employeeClaim),
 		}
 	}
@@ -545,13 +819,14 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 	claims := mintedToken{
 		Issuer:    s.issuer,
 		Audience:  s.audience,
-		Subject:   subIdentity,
+		Subject:   in.subIdentity,
 		ExpiresAt: exp.Unix(),
 		IssuedAt:  now.Unix(),
 		ID:        jti,
-		Tenant:    tenant,
+		Tenant:    in.tenant,
 		Garm:      toGarmClaimJSON(subClaim),
 		Act:       act,
+		Exec:      in.exec,
 	}
 
 	tok, err := s.keyring.Sign(claims)
@@ -562,7 +837,7 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 	return tok, s.ttl, nil
 }
 
-// errDenied is returned by exchange() for every refusal. Its text is never
+// errDenied is returned by BOTH doors for every refusal. Its text is never
 // surfaced to a caller; deniedBody is what the caller actually sees.
 var errDenied = fmt.Errorf("sts: exchange: denied")
 

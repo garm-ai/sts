@@ -231,6 +231,20 @@ func (f *fixture) form(subjectToken, requestedSubject, agent string) url.Values 
 	return v
 }
 
+// form2 builds a valid exchange-2 POST /token body: a fresh client
+// assertion and the governed door's fields, and deliberately NO
+// subject_token — its absence is half of what selects this exchange.
+func (f *fixture) form2(onBehalfOf, subjectKind, agent, tenant string) url.Values {
+	v := url.Values{}
+	v.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+	v.Set("client_assertion", clientAssertion(f.t, f.clientKey, "shop-bff", testAudience, f.now.Add(time.Minute), nextJTI()))
+	v.Set("on_behalf_of", onBehalfOf)
+	v.Set("subject_kind", subjectKind)
+	v.Set("agent", agent)
+	v.Set("tenant", tenant)
+	return v
+}
+
 // do POSTs form to the exchange handler and returns the raw response.
 func (f *fixture) do(form url.Values) *http.Response {
 	f.t.Helper()
@@ -848,5 +862,327 @@ func TestMintedTokensAreDeterministic(t *testing.T) {
 	}
 	if claimsA["jti"] == claimsB["jti"] {
 		t.Fatal("jti did not change between two independent mints")
+	}
+}
+
+// --- program plan §7 item 10: a subject may already carry its kind --------
+
+// The ONLY tuples written here are for "employee:jdoe". A service that
+// prefixed unconditionally would ask the authorizer about
+// "employee:employee:jdoe" and be denied — and the denial would name
+// nothing, because every refusal from this service is opaque.
+func TestExchangeAcceptsASubjectThatAlreadyCarriesItsKindPrefix(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	claims := f.mint(f.form(f.employeeToken("employee:jdoe", nil), "", "order-assistant"))
+	if got := str(claims, "sub"); got != "employee:jdoe" {
+		t.Fatalf("sub = %q, want employee:jdoe — a subject that already carries its issuer's kind is used as is", got)
+	}
+}
+
+// The other half, which must keep working: a bare subject IS prefixed.
+func TestExchangePrefixesABareSubject(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	claims := f.mint(f.form(f.employeeToken("jdoe", nil), "", "order-assistant"))
+	if got := str(claims, "sub"); got != "employee:jdoe" {
+		t.Fatalf("sub = %q, want employee:jdoe", got)
+	}
+}
+
+// A subject carrying a DIFFERENT kind's prefix than its issuer's configured
+// kind is refused rather than repaired. TrustedIssuer.Kind is the authority
+// on what an issuer's tokens mean (issuer.go: "never vendor-specific claim
+// sniffing"), so a token from the employee IdP whose sub says "customer:"
+// is either a misconfigured issuer or a subject claim chosen to look like
+// one. Rewriting it to "employee:customer:C-1" would hide both.
+func TestExchangeRefusesASubjectWhoseKindPrefixContradictsItsIssuer(t *testing.T) {
+	authz := newFakeAuthz()
+	// Tuples written for BOTH readings, so the refusal below cannot pass
+	// merely because nothing happened to match.
+	authz.allowSegment("customer:C-1", "retail-vip")
+	authz.allowSegment("employee:customer:C-1", "support-staff")
+	authz.allowInvoke("customer:C-1", "agent:order-assistant")
+	authz.allowInvoke("employee:customer:C-1", "agent:order-assistant")
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowSegment("customer:employee:jdoe", "retail-vip")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	authz.allowInvoke("customer:employee:jdoe", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	// The employee IdP mints it, so the issuer says employee and the
+	// subject says customer.
+	if resp := f.do(f.form(f.employeeToken("customer:C-1", nil), "", "order-assistant")); resp.StatusCode == http.StatusOK {
+		t.Fatal("minted for a subject whose kind prefix contradicts its issuer's configured kind")
+	}
+	// And the mirror, from the customer IdP.
+	if resp := f.do(f.form(f.customerToken("employee:jdoe", nil), "", "order-assistant")); resp.StatusCode == http.StatusOK {
+		t.Fatal("minted for a customer-IdP token whose sub claims to be an employee")
+	}
+	// A prefix with nothing after it names nobody.
+	if resp := f.do(f.form(f.employeeToken("employee:", nil), "", "order-assistant")); resp.StatusCode == http.StatusOK {
+		t.Fatal("minted for a subject that is nothing but a kind prefix")
+	}
+}
+
+// --- program plan §3.9: the governed door ---------------------------------
+
+func TestExchange2MintsForAnAssertedSubjectAndCarriesExec(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	claims := f.mint(f.form2("employee:jdoe", "USER", "order-assistant", "acme"))
+
+	if got := str(claims, "sub"); got != "employee:jdoe" {
+		t.Errorf("sub = %q, want employee:jdoe — the subject the runner named", got)
+	}
+	if got := str(claims, "tenant"); got != "acme" {
+		t.Errorf("tenant = %q, want acme", got)
+	}
+	if got := str(claims, "aud"); got != garmAudience {
+		t.Errorf("aud = %q, want %q", got, garmAudience)
+	}
+
+	// The exec claim: top-level, outside act, exactly the shape
+	// sts-design §4.1 reserved and program plan §3.8 fixes.
+	exec, ok := claims["exec"].(map[string]any)
+	if !ok {
+		t.Fatal("no exec claim; the governed door's whole point is recording WHICH runner obtained this token")
+	}
+	if got := str(exec, "sub"); got != "runner:shop-bff" {
+		t.Errorf("exec.sub = %q, want runner:shop-bff — the AUTHENTICATED client id, prefixed", got)
+	}
+	if got := str(exec, "iss"); got != stsIssuer {
+		t.Errorf("exec.iss = %q, want %q — this service, which is what attests the runner authenticated", got, stsIssuer)
+	}
+	if len(exec) != 2 {
+		t.Errorf("exec has %d fields, want exactly sub and iss; garmd refuses an exec that is not an object with a non-empty sub, and extra fields are authority nobody agreed to", len(exec))
+	}
+
+	// And the runner appears NOWHERE in the act chain. Putting it there
+	// would make it either assert authority it has no business asserting or
+	// carry an all-permissive claim that narrows nothing — the two failures
+	// sts-design §4.1 rejected the act-link shape over.
+	act, ok := claims["act"].(map[string]any)
+	if !ok {
+		t.Fatal("no act level; every minted token in this design carries one")
+	}
+	for level, depth := act, 0; level != nil; depth++ {
+		if sub := str(level, "sub"); strings.HasPrefix(sub, "runner:") {
+			t.Fatalf("act chain level %d names the runner (%q); provenance is exec, never an act link", depth, sub)
+		}
+		next, _ := level["act"].(map[string]any)
+		level = next
+	}
+	if got := str(act, "sub"); got != "agent:order-assistant" {
+		t.Errorf("act.sub = %q, want agent:order-assistant", got)
+	}
+	// Depth two: human at sub, agent at act, and no runner link — the fold's
+	// ceiling of four is not approached (spec §3.3).
+	if _, nested := act["act"]; nested {
+		t.Error("act carries a nested act; the governed door mints a depth-two chain")
+	}
+}
+
+// Review Focus 5. subject_token selects exchange 1 and on_behalf_of selects
+// exchange 2; there is no reading where both are meant, and silently
+// preferring one mints a token the caller did not ask for — from a verified
+// identity or an asserted one, which is the whole difference between the
+// two doors.
+func TestExchange2RefusesWhenSubjectTokenIsAlsoPresent(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	form := f.form2("employee:jdoe", "USER", "order-assistant", "acme")
+	form.Set("subject_token", f.employeeToken("jdoe", nil))
+
+	if resp := f.do(form); resp.StatusCode == http.StatusOK {
+		t.Fatal("minted a token for a request naming both a subject_token and an on_behalf_of")
+	}
+}
+
+// Review Focus 4. on_behalf_of is asserted, not verified, so its SHAPE is
+// the only thing this service can check about it. A bare "jdoe" builds an
+// identity no tuple matches, which would read back as an ordinary denial and
+// send an operator looking at their tuple store instead of their runner.
+func TestExchange2RefusesAnOnBehalfOfWithNoTypePrefix(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("jdoe", "agent:order-assistant")          // deliberately the bare form
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant") // and the right one
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	for _, bad := range []string{
+		"jdoe", "", ":jdoe", "employee:", "vendor:jdoe",
+		// Doubled prefixes, the runner-side form of program plan §7
+		// item 10. authz.allowInvoke above is written for the bare
+		// reading, not these.
+		"employee:employee:jdoe", "employee:customer:C-1", "customer:employee:jdoe",
+	} {
+		t.Run(fmt.Sprintf("on_behalf_of=%q", bad), func(t *testing.T) {
+			// The bare-form can_invoke tuple above means a service that
+			// skipped this check would actually MINT for "jdoe" — so this
+			// case fails loudly rather than passing because nothing matched.
+			if resp := f.do(f.form2(bad, "USER", "order-assistant", "acme")); resp.StatusCode == http.StatusOK {
+				t.Fatalf("minted a token for on_behalf_of %q", bad)
+			}
+		})
+	}
+}
+
+func TestExchange2RefusalsAreOpaqueAndComplete(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	// Each scenario is one rule from program plan §3.9, mutated off a form
+	// that is otherwise known-good — so a case that passes for an unrelated
+	// reason is not possible.
+	good := func() url.Values { return f.form2("employee:jdoe", "USER", "order-assistant", "acme") }
+
+	noCanRun := good()
+	noCanRun.Set("agent", "write-bot") // declared in the policy, but no can_run tuple
+
+	noCanInvoke := good()
+	noCanInvoke.Set("on_behalf_of", "employee:stranger")
+
+	presentedAct := good()
+	presentedAct.Set("act", "employee:someone-else")
+
+	badKind := good()
+	badKind.Set("subject_kind", "AGENT")
+
+	serviceKind := good()
+	serviceKind.Set("subject_kind", "SERVICE")
+
+	noTenant := good()
+	noTenant.Del("tenant")
+
+	noAgent := good()
+	noAgent.Del("agent")
+
+	badAssertion := good()
+	badAssertion.Set("client_assertion", "not-a-jwt")
+
+	wrongGrantType := good()
+	wrongGrantType.Set("grant_type", "authorization_code")
+
+	scenarios := map[string]url.Values{
+		"no can_run tuple for this runner and agent": noCanRun,
+		"no can_invoke tuple for the named subject":  noCanInvoke,
+		"the runner presented an act chain":          presentedAct,
+		"subject_kind is neither USER nor SERVICE":   badKind,
+		"subject_kind SERVICE":                       serviceKind,
+		"no tenant":                                  noTenant,
+		"no agent":                                   noAgent,
+		"client assertion does not verify":           badAssertion,
+		"wrong grant_type":                           wrongGrantType,
+	}
+
+	for name, form := range scenarios {
+		t.Run(name, func(t *testing.T) {
+			resp := f.do(form)
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 — every refusal from this service is the same status", resp.StatusCode)
+			}
+			if got := strings.TrimSpace(string(body)); got != `{"error":"access_denied"}` {
+				t.Fatalf("body = %q, want the single opaque denial; a body that varies with the reason is an enumeration oracle", got)
+			}
+		})
+	}
+
+	// And the known-good form still mints, so the mutations above are what
+	// is being refused rather than the fixture having gone stale.
+	if resp := f.do(good()); resp.StatusCode != http.StatusOK {
+		t.Fatalf("the unmutated form was refused with %d; every case above proves nothing", resp.StatusCode)
+	}
+}
+
+// The governed door must not be a way around the §3.5 clearance gate. A
+// runner asking on behalf of a customer reaches the same cap a BFF asking
+// with that customer's own token would, because both doors mint through
+// resolveAndMint.
+func TestExchange2AppliesTheInstanceAuthorizationCapToCustomerSubjects(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("customer:C-1", "sme-basic") // grants RESTRICTED via vip-extra
+	authz.allowInvoke("customer:C-1", "agent:order-assistant")
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+
+	t.Run("absent with a ceiling: capped, exactly as the direct door", func(t *testing.T) {
+		f := newFixture(t, exchangePolicy, authz, sts.InstanceAuthzConfig{Status: "absent", UnconfinedCeiling: "PUBLIC"})
+		claims := f.mint(f.form2("customer:C-1", "USER", "order-assistant", "acme"))
+		garm, _ := claims["garm"].(map[string]any)
+		if got := str(garm, "clearance"); got != "PUBLIC" {
+			t.Fatalf("garm.clearance = %q, want PUBLIC — the governed door must not be a way past the §3.5 cap", got)
+		}
+	})
+
+	t.Run("absent with no ceiling: refused, exactly as the direct door", func(t *testing.T) {
+		f := newFixture(t, exchangePolicy, authz, sts.InstanceAuthzConfig{Status: "absent"})
+		if resp := f.do(f.form2("customer:C-1", "USER", "order-assistant", "acme")); resp.StatusCode == http.StatusOK {
+			t.Fatal("minted a customer token through the governed door with instanceAuthorization absent and no ceiling")
+		}
+	})
+}
+
+// The two doors mint the same token. Everything that differs is named here
+// and nothing else may: exec (present on one, absent on the other by
+// design), and jti/iat/exp, which differ between any two mints at all.
+//
+// It is a property rather than a pair of expectations because the failure it
+// guards against is silent: a claims change applied to one door's code path
+// and not the other's produces two tokens garmd folds differently, and the
+// only place that shows up is a caller who reaches less than they should
+// through one door than the other.
+func TestBothDoorsMintTheSameTokenApartFromExec(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:order-assistant")
+	authz.allowRun("runner:shop-bff", "agent:order-assistant")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	direct := f.mint(f.form(f.employeeToken("jdoe", map[string]any{"tenant": "acme"}), "", "order-assistant"))
+	governed := f.mint(f.form2("employee:jdoe", "USER", "order-assistant", "acme"))
+
+	if _, present := direct["exec"]; present {
+		t.Error("the DIRECT door minted an exec claim; a token obtained with a human's own credential has no runner to record")
+	}
+	if _, present := governed["exec"]; !present {
+		t.Fatal("the governed door minted no exec claim")
+	}
+
+	volatile := map[string]bool{"jti": true, "iat": true, "exp": true, "exec": true}
+	normalize := func(m map[string]any) string {
+		out := make(map[string]any, len(m))
+		for k, v := range m {
+			if !volatile[k] {
+				out[k] = v
+			}
+		}
+		b, err := json.Marshal(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	if a, b := normalize(direct), normalize(governed); a != b {
+		t.Fatalf("the two doors minted different tokens for the same subject and agent.\n direct: %s\ngoverned: %s", a, b)
 	}
 }
