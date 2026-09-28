@@ -1,11 +1,11 @@
 package sts
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"os"
 	"slices"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -120,7 +120,7 @@ func LoadPolicy(path string) (*Policy, error) {
 	}
 
 	var pf policyFile
-	dec := yaml.NewDecoder(strings.NewReader(string(data)))
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true) // a typo'd key is a misconfigured identity, not a warning
 	if err := dec.Decode(&pf); err != nil {
 		return nil, fmt.Errorf("claims: parsing %s: %w", path, err)

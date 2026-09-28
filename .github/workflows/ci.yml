@@ -122,9 +122,12 @@ jobs:
       - name: checkout examples (public; source of the bank catalogue)
         uses: actions/checkout@v5
         with:
+          # No token: — garm-ai/examples is public, and this matches garmd's
+          # own public-repo checkout. `token: ''` is not "no credential":
+          # actions/checkout still writes an Authorization header, carrying an
+          # empty one.
           repository: garm-ai/examples
           path: upstream-examples
-          token: ''
       - uses: jdx/mise-action@v2
         with:
           install: true
