@@ -300,6 +300,15 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("sts: config: issuers is empty; at least one trusted issuer is required")
 	}
 	issuers := make([]TrustedIssuer, 0, len(cf.Issuers))
+	// seenIssuer catches two entries sharing an `iss`. NewVerifier keys its
+	// lookup table by Issuer, so a duplicate silently wins on last write —
+	// and since TrustedIssuer.Kind is the sole input to the caller's kind,
+	// which decides whether instanceAuthorization's clearance cap runs at
+	// all, a second entry saying kind: employee would turn the customer cap
+	// off for that IdP with no diagnostic anywhere. Reject it here, the way
+	// NewKeyring rejects a duplicate kid and NewClientRegistry a duplicate
+	// client id.
+	seenIssuer := make(map[string]int, len(cf.Issuers))
 	for i, isf := range cf.Issuers {
 		if isf.Name == "" {
 			return nil, fmt.Errorf("sts: config: issuers[%d].name is empty", i)
@@ -307,8 +316,22 @@ func LoadConfig(path string) (*Config, error) {
 		if isf.Issuer == "" {
 			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): iss is empty", i, isf.Name)
 		}
+		if first, dup := seenIssuer[isf.Issuer]; dup {
+			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): duplicate iss %q, already configured by issuers[%d] (%s); "+
+				"two entries for one issuer would silently keep only the last, including its kind",
+				i, isf.Name, isf.Issuer, first, cf.Issuers[first].Name)
+		}
+		seenIssuer[isf.Issuer] = i
 		if isf.JWKS == "" {
 			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): jwks is empty", i, isf.Name)
+		}
+		// An empty audience list makes every token from this issuer fail
+		// containment (see Verifier.checkRegistered), so an issuer
+		// configured without one can never serve a request — a startup
+		// failure, not a denial per request.
+		if len(isf.Audience) == 0 {
+			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): audience is empty; "+
+				"without it every token from this issuer fails the audience check", i, isf.Name)
 		}
 		if isf.Kind != "customer" && isf.Kind != "employee" {
 			return nil, fmt.Errorf("sts: config: issuers[%d] (%s): kind %q must be \"customer\" or \"employee\"", i, isf.Name, isf.Kind)
@@ -325,6 +348,14 @@ func LoadConfig(path string) (*Config, error) {
 
 	// --- clients ------------------------------------------------------------
 
+	// A config with no clients loads, binds, serves its JWKS, and denies
+	// every POST /token with "unknown client" — a service that cannot
+	// perform the one exchange it exists to perform. That is a startup
+	// failure for the same reason an empty issuers or keys.keys list is.
+	if len(cf.Clients) == 0 {
+		return nil, fmt.Errorf("sts: config: clients is empty; at least one client is required, " +
+			"or every POST /token is denied as an unknown client")
+	}
 	clients := make([]ClientConfig, 0, len(cf.Clients))
 	for i, cl := range cf.Clients {
 		if cl.ID == "" {
