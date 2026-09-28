@@ -55,6 +55,10 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/token", srv.Handler())
 	mux.Handle("/.well-known/jwks.json", srv.Keyring().Handler())
+	// Published so a verifier can check, at ITS startup, that it was
+	// configured to expect what this service actually mints. See metadata.go.
+	mux.Handle("/.well-known/oauth-authorization-server",
+		srv.MetadataHandler(cfg.Issuer+"/.well-known/jwks.json", cfg.Issuer+"/token"))
 
 	h := &http.Server{
 		Addr:              cfg.Listen,
