@@ -396,7 +396,10 @@ checked:
   a tool's `approver_min_clearance`, its required compartments, and its
   `max_grant_age_seconds`. An approver whose clearance does not meet a
   tool's bar receives a grant that `garmd` then refuses: a poor experience,
-  deliberately, and not a hole.
+  deliberately, and not a hole. The one rule neither service holds is the
+  four-eyes exclusion — the run's own subject may not approve its own task —
+  which the runner enforces at the inbox (`agentd`'s task predicate), where
+  the run is known.
 - **Single-use enforcement of a grant's `jti`.** Every grant carries a fresh
   one, and spending it at most once is `garmd`'s side of the contract; this
   service keeps no record of the grants it has minted.
