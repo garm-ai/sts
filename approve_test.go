@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/garm-ai/contracts/grant"
+	"github.com/garm-ai/contracts/grants"
 	"github.com/garm-ai/sts"
 	jose "github.com/go-jose/go-jose/v4"
 )
@@ -327,7 +328,13 @@ func TestApproveRefusalsAreOpaqueAndComplete(t *testing.T) {
 		"tool has no package part": mutate(func(b map[string]any) { b["tool"] = "initiate_payment" }),
 		"subject is not prefixed":  mutate(func(b map[string]any) { b["subject"] = "C-8123" }),
 		"subject is empty":         mutate(func(b map[string]any) { b["subject"] = "" }),
-		"material path is empty":   mutate(func(b map[string]any) { b["material"] = map[string]string{"": "25000"} }),
+		// Sending the field says the caller has a task in mind; sending it
+		// blank says the value was lost on the way. Omitting it entirely is
+		// a different request and a legitimate one — see
+		// TestApproveWithNoTaskMintsNoTaskClaimAtAll.
+		"task_id is present but empty":      mutate(func(b map[string]any) { b["task_id"] = "" }),
+		"task_id is present but whitespace": mutate(func(b map[string]any) { b["task_id"] = "   " }),
+		"material path is empty":            mutate(func(b map[string]any) { b["material"] = map[string]string{"": "25000"} }),
 		"material path has a newline": mutate(func(b map[string]any) {
 			b["material"] = map[string]string{"amount\nbeneficiary_iban": "25000"}
 		}),
@@ -589,5 +596,153 @@ func TestApproveRefusesADuplicateTopLevelKey(t *testing.T) {
 	}
 	if got := strings.TrimSpace(rec.Body.String()); got != `{"error":"access_denied"}` {
 		t.Fatalf("body = %q, want the single opaque denial", got)
+	}
+}
+
+// theTask is the id a tasks service hands the page, and what every approval
+// below is given on. Any opaque string will do — this service resolves no
+// task and never looks one up.
+const theTask = "tsk_d19f4c"
+
+// approveToken posts an approval expected to SUCCEED and returns the grant
+// exactly as the wire carries it, for the tests that hand the string to the
+// SHARED reader instead of to this package's own decoder.
+func (f *fixture) approveToken(bearer string, body any) string {
+	f.t.Helper()
+	resp := f.approve(bearer, body)
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		f.t.Fatalf("approve failed: status %d, body %s", resp.StatusCode, raw)
+	}
+	var out struct {
+		Grant string `json:"grant"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		f.t.Fatalf("decoding response: %v; body %s", err, raw)
+	}
+	if out.Grant == "" {
+		f.t.Fatal("approve answered 200 with no grant")
+	}
+	return out.Grant
+}
+
+// grantKeys is this service's published JWKS read back through the shared
+// key reader, which is how a consumer gets it: fetch the document, parse it
+// with grants.ParseJWKS. A test that verifies through this is exercising the
+// real path rather than a private handle on the signing key.
+func (f *fixture) grantKeys() grants.KeySource {
+	f.t.Helper()
+	doc, err := json.Marshal(f.kr.JWKS())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	ks, err := grants.ParseJWKS(doc)
+	if err != nil {
+		f.t.Fatalf("this service's own JWKS did not parse with the shared reader: %v", err)
+	}
+	return ks
+}
+
+// The claim the tasks service turns on, proved with the reader that service
+// actually uses: contracts/grants.Verify — ParseClaims behind a signature
+// check — and then CheckTask. Parsing the token by hand here would only
+// prove that this file agrees with itself, and the whole point of the claim
+// is that two repositories agree about it.
+func TestApproveMintsTheTaskClaimTheTasksServiceChecks(t *testing.T) {
+	f := newFixture(t, exchangePolicy, newFakeAuthz(), enforced)
+	bearer := f.employeeToken("jdoe", map[string]any{"garm": approverGarm("RESTRICTED", "financial")})
+
+	// `task_id` on the wire, because that is the field studiod sends
+	// (studio/internal/sts/client.go).
+	body := f.approveBody("payments.v1.initiate_payment", "customer:C-8123", bankMaterial())
+	body["task_id"] = theTask
+
+	tok := f.approveToken(bearer, body)
+
+	c, err := grants.Verify(tok, f.grantKeys())
+	if err != nil {
+		t.Fatalf("the shared reader could not verify a grant this service minted: %v", err)
+	}
+	if c.Task != theTask {
+		t.Fatalf("Claims.Task = %q, want %q — decide_task reads this field and nothing else", c.Task, theTask)
+	}
+	if err := c.CheckTask(theTask); err != nil {
+		t.Fatalf("CheckTask refused a grant minted for that very task: %v", err)
+	}
+	// And the binding is a binding: the same values approved on one task do
+	// not authorise the decision on another, which is the reason the claim
+	// exists at all.
+	if err := c.CheckTask("tsk_someone_else"); err == nil {
+		t.Error("a grant given on one task was accepted for another")
+	}
+	// Every other check decide_task makes still passes, so the task claim
+	// is the only thing this test changed.
+	for name, err := range map[string]error{
+		"no act":   c.CheckNoAct(),
+		"tool":     c.CheckTool("payments.v1.initiate_payment"),
+		"subject":  c.CheckSubject("customer:C-8123"),
+		"material": c.CheckMaterial(bankMaterial()),
+	} {
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	// The spelling, asserted here rather than left to a consumer: garmd's
+	// own copy reads firstOf(g, "task", "task_id") and would accept either,
+	// so its tolerance cannot tell us whether this service minted the name
+	// the contract declares. And exactly once — the same fact under two
+	// keys in one signed credential is two things to keep in step.
+	g := f.decodeAndVerify(tok)["garm_grant"].(map[string]any)
+	if got := str(g, "task"); got != theTask {
+		t.Errorf(`garm_grant.task = %q, want %q — contracts/grants.ParseClaims reads "task"`, got, theTask)
+	}
+	if _, present := g["task_id"]; present {
+		t.Error("the grant carries task_id as well as task; the request field's name must not travel into the claim")
+	}
+}
+
+// An approval need not be on a task. agentd approves calls that are spent at
+// garmd's direct door and sends no task_id at all, and garmd reads no task
+// claim — so a request that names none is minted rather than refused.
+//
+// What matters is that the claim is then ABSENT, not empty: CheckTask reads
+// an absent claim as "this approves the material rather than a decision" and
+// says so, while an empty string would be a value somebody appears to have
+// set. The two are different states and only one of them is true here.
+func TestApproveWithNoTaskMintsNoTaskClaimAtAll(t *testing.T) {
+	f := newFixture(t, exchangePolicy, newFakeAuthz(), enforced)
+	bearer := f.employeeToken("jdoe", map[string]any{"garm": approverGarm("RESTRICTED", "financial")})
+
+	tok := f.approveToken(bearer, f.approveBody("payments.v1.initiate_payment", "customer:C-8123", bankMaterial()))
+
+	g := f.decodeAndVerify(tok)["garm_grant"].(map[string]any)
+	if v, present := g["task"]; present {
+		t.Errorf("garm_grant.task is present (%#v) on an approval that named no task; absent and empty are different claims to the reader", v)
+	}
+
+	c, err := grants.Verify(tok, f.grantKeys())
+	if err != nil {
+		t.Fatalf("the shared reader could not verify a grant this service minted: %v", err)
+	}
+	// Still a perfectly good grant at the door that does not read tasks.
+	for name, err := range map[string]error{
+		"no act":   c.CheckNoAct(),
+		"tool":     c.CheckTool("payments.v1.initiate_payment"),
+		"subject":  c.CheckSubject("customer:C-8123"),
+		"material": c.CheckMaterial(bankMaterial()),
+	} {
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	// And refused by the door that does, with the refusal naming the real
+	// reason rather than a task mismatch against "".
+	err = c.CheckTask(theTask)
+	if err == nil {
+		t.Fatal("a grant carrying no task claim was accepted for a task decision")
+	}
+	if !strings.Contains(err.Error(), "no task claim") {
+		t.Errorf("the refusal does not say the grant carries no task: %v", err)
 	}
 }

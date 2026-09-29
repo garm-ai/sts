@@ -263,6 +263,7 @@ one before it will run a tool that declares it needs human approval.
 | `client_assertion_type` | optional; if present it must be `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` |
 | `tool` | the tool's FQN, e.g. `payments.v1.initiate_payment` — shape-checked only, since this service holds no catalogue |
 | `subject` | whose call was approved, type-prefixed, e.g. `customer:C-8123` |
+| `task_id` | optional; the task the approval was given on, copied verbatim into the grant's `task` claim |
 | `material` | a flat map of dotted path → the value's canonical **text** form: the values the human actually saw |
 
 The assertion is in the **body**, not a header: RFC 7523 puts it in the
@@ -289,6 +290,7 @@ The grant itself:
   "garm_grant": {
     "tool": "payments.v1.initiate_payment",
     "subject": "customer:C-8123",
+    "task": "tsk_d19f4c",
     "material": "sha256:...",
     "approver": "employee:jdoe",
     "approver_clearance": "RESTRICTED",
@@ -308,6 +310,28 @@ The grant itself:
 - **The approver must be `employee` kind**, decided by `TrustedIssuer.Kind`
   — per-issuer configuration, never sniffed from the token, exactly as on
   the direct door. A customer cannot approve a payment.
+- **The claim is `task`; the request field is `task_id`.** The names differ
+  on purpose and neither moves alone: `task_id` is what `studiod` sends, and
+  `task` is what the shared reader
+  (`github.com/garm-ai/contracts/grants.ParseClaims`) reads and what the
+  contract declares. `garmd`'s own copy currently reads either spelling, but
+  that is one reader being generous rather than a second permitted name, so
+  this service mints `task` alone — the same fact under two keys in one
+  signed credential would be two things to keep in step. The value is copied
+  in **verbatim**, never looked up: this service holds no tasks, and copying
+  is exactly what binds one grant to one task, since two tasks over identical
+  material (the same payment asked twice) digest identically.
+- **`task_id` is optional, and an absent task means an absent claim.** Not
+  every approval is on a task: one spent at `garmd`'s direct door carries
+  none, and `garmd` reads no task claim. Such a request mints a grant with
+  **no `task` key at all** rather than an empty one, because
+  `grants.CheckTask` distinguishes the two — an absent claim is refused with
+  "the grant carries no task claim, so it approves the material rather than
+  this decision", which is the true reason. A `task_id` that is *present but
+  blank* is refused here instead: sending the field says the caller has a
+  task in mind, and minting a blank binding would produce a grant
+  `tasksd`'s `decide_task` is certain to refuse in front of the person who
+  already clicked approve.
 - **`approver` is built by the same `identityForKind` the direct door uses**,
   so a persona token already carrying `employee:jdoe` does not become
   `employee:employee:jdoe`, and a subject whose prefix contradicts its
@@ -374,6 +398,7 @@ checked:
 | the approver's token asserts no usable `garm` authority | nothing to record |
 | `tool` is not a well-formed FQN (`pkg.name`) | shape-only; this service holds no catalogue |
 | `subject` is not type-prefixed | e.g. `customer:C-8123` |
+| `task_id` is present but blank | omitting it entirely is a different request, and a legitimate one |
 | a `material` path is rejected by `grant.ValidPath` | would forge a separator in the digest |
 
 ## What is NOT built

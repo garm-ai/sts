@@ -72,6 +72,30 @@ type approveRequest struct {
 	// authorises another's payment.
 	Subject string `json:"subject"`
 
+	// TaskID is the task the approval was given on, when there is one. It
+	// is copied into the grant's `task` claim and never looked up: this
+	// service holds no tasks, and copying is exactly what binds one grant
+	// to one task — two tasks over identical material (the same payment
+	// asked twice) digest identically and so cannot be told apart by the
+	// material alone.
+	//
+	// The wire field and the claim deliberately have DIFFERENT names, and
+	// neither is free to move on its own. The field is `task_id` because
+	// that is what studiod already sends (studio/internal/sts/client.go);
+	// the claim is `task` because that is what the shared reader
+	// (contracts/grants.ParseClaims) reads and what the contract declares.
+	//
+	// A POINTER, because "absent" and "empty" are different requests and
+	// the far side can tell them apart. Absent is a caller with no task —
+	// agentd's /approve sends no task_id, and its grants are spent at
+	// garmd's direct door, which reads no task claim — and it mints a
+	// grant carrying no `task` key at all. Present-but-blank is a caller
+	// that meant to name a task and lost the value; it is refused in
+	// approve() rather than minted, because a grant with a blank binding
+	// is one contracts/grants.CheckTask is certain to refuse later, at the
+	// tasks service, in front of the person who clicked approve.
+	TaskID *string `json:"task_id"`
+
 	// Material is a flat map of dotted path to the value's canonical text
 	// form — the values the human actually saw. This service digests what
 	// it is GIVEN and never resolves a path itself, which is why it needs
@@ -96,15 +120,27 @@ type approveResponse struct {
 // is refused with a message about the wrong thing — an approver who "held
 // %q" when the real fault is a misspelled JSON key.
 //
-// There is no `task` field here, and the shared reader declares one. That is
-// a gap rather than a disagreement about the name: a caller sends `task_id`
-// and this service does not copy it in, so a grant it mints carries no task
-// binding and a consumer that requires one (contracts/grants.CheckTask)
-// refuses it. Adding the field is a change to what this endpoint reads, not
-// a rename, which is why it is not done here.
+// The task claim is spelled `task`, and it is copied from the request's
+// `task_id` field. Both halves of that divergence are load-bearing:
+// contracts/grants.ParseClaims reads `task`, and studiod sends `task_id`.
+// garmd's own copy (garmd/internal/grants/claims.go) currently reads
+// firstOf(g, "task", "task_id") and so tolerates either spelling — that is
+// one reader being generous, not a second permitted name. This service
+// mints `task` alone: minting both would put one fact in a signed
+// credential twice, two things to keep in step and a signed disagreement
+// between them possible. A later reader tempted to "fix" this to `task_id`
+// would break the tasks service, which reads only the name the contract
+// declares.
+//
+// Task is omitempty because an approval need not be on a task: one spent at
+// garmd's direct door carries none, and CheckTask distinguishes an ABSENT
+// claim ("the grant carries no task claim, so it approves the material
+// rather than this decision") from one that names another task. An empty
+// string would be neither of those, so the key is left out entirely.
 type grantClaimJSON struct {
 	Tool                 string   `json:"tool"`
 	Subject              string   `json:"subject"`
+	Task                 string   `json:"task,omitempty"`
 	Material             string   `json:"material"`
 	Approver             string   `json:"approver"`
 	ApproverClearance    string   `json:"approver_clearance"`
@@ -296,6 +332,21 @@ func (s *Server) approve(r *http.Request) (string, time.Duration, error) {
 		s.denyApprove(ctx, "subject is not a type-prefixed identity", "client", clientID, "subject", req.Subject)
 		return "", 0, errDenied
 	}
+	// The task, when the caller names one. Shape only, like everything else
+	// in these frames: this service resolves no task, so whether it exists
+	// is the tasks service's question, and the value is copied verbatim —
+	// one this service reshaped would no longer match the task it names.
+	//
+	// A blank task_id is refused rather than dropped. Sending the field at
+	// all says the caller has a task in mind; sending it empty says the
+	// value was lost on the way here, and minting anyway would hand back a
+	// grant that decide_task refuses, with the refusal arriving in front of
+	// the person who already clicked approve instead of in front of the
+	// service that sent the blank.
+	if req.TaskID != nil && strings.TrimSpace(*req.TaskID) == "" {
+		s.denyApprove(ctx, "task_id is present but blank", "client", clientID)
+		return "", 0, errDenied
+	}
 	for path := range req.Material {
 		if err := grant.ValidPath(path); err != nil {
 			s.denyApprove(ctx, "material path is malformed", "client", clientID, "err", err)
@@ -325,6 +376,14 @@ func (s *Server) approve(r *http.Request) (string, time.Duration, error) {
 		compartments = []string{}
 	}
 
+	// Absent stays absent: the empty string here omits the claim (the field
+	// is omitempty), rather than minting `"task": ""`, which is a third
+	// state no reader has a meaning for.
+	task := ""
+	if req.TaskID != nil {
+		task = *req.TaskID
+	}
+
 	claims := mintedGrant{
 		Issuer:    s.issuer,
 		Audience:  s.audience,
@@ -334,6 +393,7 @@ func (s *Server) approve(r *http.Request) (string, time.Duration, error) {
 		Grant: grantClaimJSON{
 			Tool:                 req.Tool,
 			Subject:              req.Subject,
+			Task:                 task,
 			Material:             digest,
 			Approver:             approver,
 			ApproverClearance:    authority.Clearance,
