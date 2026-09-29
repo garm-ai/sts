@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/garm-ai/garm/contracts/grant"
+	"github.com/garm-ai/contracts/grant"
 	"github.com/garm-ai/sts"
 	jose "github.com/go-jose/go-jose/v4"
 )
@@ -96,10 +96,11 @@ func (f *fixture) grantClaims(bearer string, body any) map[string]any {
 }
 
 // TestApproveMintsAGrantGarmdCanRead asserts the claim NAMES, not just the
-// values. Every string checked here is one garmd/internal/grants/claims.go
-// reads out of a map (parseGrantClaims, :60-73) — and a name that drifts
-// decodes to "" over there and is refused with a message about the wrong
-// thing entirely.
+// values. Every string checked here is one the shared reader in
+// github.com/garm-ai/contracts/grants pulls out of a map (ParseClaims), and
+// one garmd's own copy pulls out too (parseGrantClaims) — and a name that
+// drifts decodes to "" over there and is refused with a message about the
+// wrong thing entirely.
 func TestApproveMintsAGrantGarmdCanRead(t *testing.T) {
 	f := newFixture(t, exchangePolicy, newFakeAuthz(), enforced)
 	bearer := f.employeeToken("jdoe", map[string]any{"garm": approverGarm("RESTRICTED", "financial")})

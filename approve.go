@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/garm-ai/garm/contracts/grant"
+	"github.com/garm-ai/contracts/grant"
 )
 
 // defaultApproveTTL is how long a minted grant is valid when
@@ -87,12 +87,21 @@ type approveResponse struct {
 }
 
 // grantClaimJSON is the `garm_grant` claim, field for field as
-// garmd/internal/grants/claims.go's parseGrantClaims reads it.
+// github.com/garm-ai/contracts/grants reads it (ParseClaims), and as
+// garmd/internal/grants/claims.go's parseGrantClaims still reads it in the
+// daemon's own copy.
 //
-// Renaming a key here is not a refactor. The far side pulls these exact
+// Renaming a key here is not a refactor. Every far side pulls these exact
 // strings out of a decoded map, so a drifted name yields "" over there and
 // is refused with a message about the wrong thing — an approver who "held
 // %q" when the real fault is a misspelled JSON key.
+//
+// There is no `task` field here, and the shared reader declares one. That is
+// a gap rather than a disagreement about the name: a caller sends `task_id`
+// and this service does not copy it in, so a grant it mints carries no task
+// binding and a consumer that requires one (contracts/grants.CheckTask)
+// refuses it. Adding the field is a change to what this endpoint reads, not
+// a rename, which is why it is not done here.
 type grantClaimJSON struct {
 	Tool                 string   `json:"tool"`
 	Subject              string   `json:"subject"`

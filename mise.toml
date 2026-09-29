@@ -54,10 +54,13 @@ description = "Install the garm CLI at the pinned version"
 # Pinned, not @latest, for the same reason examples pins it: the vocabulary
 # a claims policy is checked against must not shift because someone upgraded
 # a CLI on a laptop. The CLI is a BINARY here, installed rather than
-# imported — separate from the module dependency approve.go takes on
-# github.com/garm-ai/garm/contracts/grant, which exists so the digest a
-# grant carries and the digest garmd recomputes are one function and not
-# two implementations (approval-grants design, "Decided" item 4).
+# imported — and since the split it is all github.com/garm-ai/garm still is.
+# The module dependency approve.go takes is on
+# github.com/garm-ai/contracts/grant, a separate module, which exists so the
+# digest a grant carries and the digest garmd recomputes are one function and
+# not two implementations (approval-grants design, "Decided" item 4). The two
+# versions move independently: bumping this pin cannot change the digest, and
+# bumping the contract cannot change the vocabulary checked below.
 #
 # v0.14.2: the first tag whose `claims check` and `catalogue build` read the
 # bank example as it is laid out today (agent manifests, material fields).

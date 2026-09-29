@@ -5,7 +5,7 @@ go 1.26.0
 require github.com/go-jose/go-jose/v4 v4.1.5
 
 require (
-	github.com/garm-ai/garm v0.13.0
+	github.com/garm-ai/contracts v0.2.0
 	github.com/openfga/go-sdk v0.8.3
 	github.com/openfga/language/pkg/go v0.3.1
 	gopkg.in/yaml.v3 v3.0.1

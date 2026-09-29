@@ -313,9 +313,14 @@ The grant itself:
   `employee:employee:jdoe`, and a subject whose prefix contradicts its
   issuer's kind is refused rather than repaired.
 - **`material` is a digest, computed by `grant.Digest` from
-  `github.com/garm-ai/garm/contracts/grant`** — the *same function* `garmd`
+  `github.com/garm-ai/contracts/grant`** — the *same function* `garmd`
   recomputes it with, a module dependency rather than a second
-  implementation. Two independent derivations of one string is a divergence
+  implementation. That package used to live at
+  `github.com/garm-ai/garm/contracts/grant`; the contract is now a module of
+  its own and `garm` is only the CLI, so this service depends on the
+  contract and not on a command-line tool. The function itself is unchanged
+  byte for byte across the move, which is why no grant already minted means
+  anything different. Two independent derivations of one string is a divergence
   waiting to happen: if the sides ever disagree byte for byte, every
   approval is refused or — worse — one matches a request the approver never
   saw, and neither side can detect that alone. This service digests what it
