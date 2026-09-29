@@ -561,7 +561,7 @@ static when untagged, OpenFGA under `-tags openfga` — in
 
 ## Running it
 
-Once started, `cmd/sts/main.go` serves four routes: `POST /token` (both
+Once started, `stsd.Serve` serves four routes: `POST /token` (both
 exchanges), `POST /approve` (the grant-minting endpoint), the JWKS at
 `/.well-known/jwks.json`, and the metadata document at
 `/.well-known/oauth-authorization-server`.
@@ -601,12 +601,24 @@ curl -s localhost:8080/.well-known/jwks.json
 is a local/dev config, and the service loudly warns on startup that it is
 serving plaintext. Set `STS_TLS_CERT` and `STS_TLS_KEY` (paths to a
 certificate and key) in production, or terminate TLS in front of it at a
-proxy or mesh sidecar; `cmd/sts/main.go` refuses to pretend plaintext is
+proxy or mesh sidecar; `stsd.Serve` refuses to pretend plaintext is
 fine, but it does not refuse to run without TLS, since a sidecar is a
 legitimate place to terminate it.
 
 Shutdown is signal-aware (`SIGINT`/`SIGTERM`) and graceful, with a 5 second
-timeout for in-flight requests to finish.
+timeout for in-flight requests to finish. `cmd/sts/main.go` turns the signal
+into a cancelled context and `stsd.Serve` drains on it, so there is one
+shutdown path rather than one per caller.
+
+### Running it in-process
+
+The binary is the way you run this service. `stsd.Serve(ctx, stsd.Config{…})`
+exists so `garm-ai/stack`'s `garmstack` can run garmd, the STS and agentd as
+goroutines in one process for local development and demonstration — each
+still speaking HTTP and NATS to the others. That single-process mode is
+never for production: one process holding this service's signing key,
+agentd's client key and garmd's verifier configuration is one compromise
+away from all three.
 
 ## The metadata document
 
@@ -626,7 +638,7 @@ what's meant, plus two extensions this service's one downstream needs:
 | `garm_audience` | `cfg.Audience` — the field a verifier actually has to agree with; RFC 8414 has no field for the audience an authorization server *mints* |
 | `garm_approve_endpoint` | `<issuer>/approve` — RFC 8414 has no field for a second, non-OAuth endpoint either |
 
-**The trap:** `cmd/sts/main.go` builds every URL above by
+**The trap:** `stsd.Serve` builds every URL above by
 string-concatenating `cfg.Issuer` with a path
 (`cfg.Issuer+"/.well-known/jwks.json"`, and so on) — there is no separate
 "public base URL" setting. `issuer` therefore has to be the actual,
@@ -653,7 +665,8 @@ correctly-configured document, because nothing here checks reachability.
 | `approve.go` | The `POST /approve` handler: mints the grant that records a human's yes |
 | `metadata.go` | Serves the discovery document at `/.well-known/oauth-authorization-server` |
 | `config.go` | Loads and validates `deploy/config.yaml`'s shape, wires a `Server` |
-| `cmd/sts/main.go` | The binary: flags, logging, TLS, graceful shutdown |
+| `cmd/sts/main.go` | The binary: flags, the environment, the signal context |
+| `stsd/stsd.go` | `Serve`: the routes, the HTTP server and the drain — what the binary and `garmstack` both run |
 | `cmd/sts/authz_static.go`, `cmd/sts/authz_openfga.go` | Which `Authorizer` this build gets — mutually exclusive build tags |
 | `deploy/config.yaml` | A complete, loadable example configuration |
 | `deploy/claims.yaml` | An example claims policy |

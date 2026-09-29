@@ -125,7 +125,7 @@ type mintedGrant struct {
 }
 
 // ApproveHandler returns the POST /approve handler. Mounting it is
-// cmd/sts/main.go's job, as it is for Handler and the JWKS.
+// stsd.Serve's job, as it is for Handler and the JWKS.
 func (s *Server) ApproveHandler() http.Handler {
 	return http.HandlerFunc(s.serveApprove)
 }

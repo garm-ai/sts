@@ -281,7 +281,7 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(s.serveToken)
 }
 
-// Keyring returns the Server's Keyring, so a caller (cmd/sts's main) can
+// Keyring returns the Server's Keyring, so a caller (stsd.Serve) can
 // mount its JWKS handler alongside Handler() without constructing a second,
 // redundant Keyring from the same configuration.
 func (s *Server) Keyring() *Keyring {
