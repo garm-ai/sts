@@ -66,7 +66,13 @@ description = "Install the garm CLI at the pinned version"
 # bank example as it is laid out today (agent manifests, material fields).
 # Pinned, not latest, so a garm release cannot turn this repository's CI red
 # on its own; bump it deliberately when the bank example moves.
-run = "go install github.com/garm-ai/garm/cmd/garm@v0.14.2"
+# IT MUST MOVE WITH examples, because that tree is what claims-check builds.
+# v0.23.0-rc.1 is the pin examples itself uses: v0.20.0 is the release that
+# reads `catalogue.yaml` at all, and the bank's sixth agent declares
+# MODE_WORKFLOW, whose fields arrive in contracts v0.6.0-rc.1 — the version
+# this CLI links. An older CLI composes the catalogue from a descriptor set
+# that has no such fields, SILENTLY.
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.23.0-rc.1"
 
 [tasks."claims-check"]
 description = "Assert deploy/claims.yaml only references what the bank catalogue declares"
@@ -86,7 +92,16 @@ set -e
 EXAMPLES_DIR="${EXAMPLES_DIR:-../examples}"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-garm catalogue build --proto "$EXAMPLES_DIR/bank/proto" -o "$WORK/bank.binpb" --source garm-ai/examples/bank
+# examples composes its catalogue from a manifest now: the bank's proto tree
+# takes garm/meta/v1/meta.proto and the rest from the contracts MODULE rather
+# than vendoring them, so `--proto` on that directory cannot resolve its own
+# imports. Build from the manifest when the checkout has one, which is also
+# the only way the module versions resolve to that tree's go.mod.
+if [ -f "$EXAMPLES_DIR/catalogue.yaml" ]; then
+  (cd "$EXAMPLES_DIR" && garm catalogue build -o "$WORK/bank.binpb")
+else
+  garm catalogue build --proto "$EXAMPLES_DIR/bank/proto" -o "$WORK/bank.binpb" --source garm-ai/examples/bank
+fi
 garm claims check deploy/claims.yaml --against "$WORK/bank.binpb"
 """
 
