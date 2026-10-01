@@ -334,8 +334,13 @@ func TestDeployClaimsYAMLExampleLoadsAndStaysInSync(t *testing.T) {
 	if len(svc.Compartments) != 0 {
 		t.Fatalf("agentd compartments = %v, want none — create_task requires none, and a compartment here is one every run can reach", svc.Compartments)
 	}
-	if svc.ToolSets != nil {
-		t.Fatalf("agentd tool_sets = %v, want absent until create_task's own set exists; a scoped caller cannot reach a set-less tool", svc.ToolSets)
+	// SCOPED, and to exactly one set. An absent tool_sets would mean EVERY set
+	// to garmd, and for the platform's one runner that is every
+	// CLEARANCE_PUBLIC, uncompartmented, VERB_WRITE tool in whatever catalogue
+	// is mounted — reachable by every run it executes. `escalation` is the set
+	// create_task was moved into (contracts v0.8.0).
+	if !sameSet(svc.ToolSets, []string{"escalation"}) {
+		t.Fatalf("agentd tool_sets = %v, want exactly [escalation] — absent would make the runner unscoped", svc.ToolSets)
 	}
 }
 

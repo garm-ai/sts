@@ -61,14 +61,24 @@ services:
   agentd:
     clearance: PUBLIC
     verbs: [WRITE]
-    # TODO(toolset): create_task is being moved into a dedicated tool set in
-    # garm-ai/contracts. When that set has a name it goes HERE, as
-    # `tool_sets: [<name>]`, and this service stops being unscoped. Until
-    # then tool_sets is absent on purpose — garmd reads absent as every set,
-    # and create_task declares no set today, which a SCOPED caller cannot
-    # reach at all. The name is not guessed: a tool set the catalogue does
-    # not declare makes every mint for this service reach nothing, and since
-    # `garm claims check` does not read this block, nothing would catch it.
+    # SCOPED, and scoped to one set. `escalation` is the set
+    # garm.tasks.v1.create_task was moved into (contracts v0.8.0): it is named
+    # for the act and not for the caller, because a set named after who holds
+    # it stops being a grouping of tools and becomes a second, weaker
+    # audience.
+    #
+    # Being scoped is the point. Absent `tool_sets` means EVERY set to garmd,
+    # which for this principal means every CLEARANCE_PUBLIC, uncompartmented,
+    # VERB_WRITE tool in whatever catalogue is mounted — and whatever the
+    # platform's one runner holds, every run it executes can reach.
+    #
+    # NOTHING HERE CATCHES A TYPO IN THIS NAME. `garm claims check` reads
+    # `roles:` and not this block, so a misspelling passes, and the failure is
+    # silent in the direction that looks like working software: the mint
+    # succeeds, the token carries a set the catalogue never declared, and
+    # create_task is simply unreachable. It fails CLOSED, which is the right
+    # direction and still a bad diagnostic.
+    tool_sets: [escalation]
     #
     # Also not yet exercisable end to end HERE: garmd folds sub ∩ act, so the
     # agent the runner names in the chain must itself carry WRITE, and the
