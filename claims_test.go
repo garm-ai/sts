@@ -315,8 +315,8 @@ func TestDeployClaimsYAMLExampleLoadsAndStaysInSync(t *testing.T) {
 
 	// The worked `services:` entry. It is the only declaration in the
 	// repository that lets a runner open a task at all, so a hand-edit that
-	// widens it — a compartment, a higher clearance, a verb beyond WRITE —
-	// fails here rather than shipping. The whole platform's runner holds
+	// widens it — a compartment, a higher clearance, a verb beyond READ and
+	// WRITE — fails here rather than shipping. The whole platform's runner holds
 	// this, and every run can reach whatever it holds.
 	svc, err := p.ForService("agentd")
 	if err != nil {
@@ -326,19 +326,34 @@ func TestDeployClaimsYAMLExampleLoadsAndStaysInSync(t *testing.T) {
 		t.Fatalf("agentd kind = %q, want SERVICE", svc.Kind)
 	}
 	if svc.Clearance != "PUBLIC" {
-		t.Fatalf("agentd clearance = %q, want PUBLIC — create_task declares min_clearance CLEARANCE_PUBLIC and nothing higher is warranted", svc.Clearance)
+		t.Fatalf("agentd clearance = %q, want PUBLIC — create_task and get_task_grant both declare min_clearance CLEARANCE_PUBLIC and nothing higher is warranted", svc.Clearance)
 	}
-	if !sameSet(svc.Verbs, []string{"WRITE"}) {
-		t.Fatalf("agentd verbs = %v, want exactly [WRITE]", svc.Verbs)
+	// READ and WRITE, one per tool this principal reaches: create_task declares
+	// VERB_WRITE, and get_task_grant — the read back a parked run needs, because
+	// the decided event carries a reference and never the grant — declares
+	// VERB_READ. A THIRD VERB IS NOT A LINE TO ADD HERE: DESTRUCTIVE is the one
+	// left, nothing in `escalation` declares it, and a runner that held it would
+	// hand it to every run it executes.
+	//
+	// What keeps READ narrow is the SET and not the verb. Scoped to `escalation`,
+	// which holds create_task and get_task_grant and nothing else, READ reaches
+	// one more tool; unscoped it would reach every CLEARANCE_PUBLIC,
+	// uncompartmented, VERB_READ tool in whatever catalogue is mounted. The
+	// tool_sets assertion below is therefore load-bearing for this line too, which
+	// is why the two are asserted together.
+	if !sameSet(svc.Verbs, []string{"READ", "WRITE"}) {
+		t.Fatalf("agentd verbs = %v, want exactly [READ WRITE]", svc.Verbs)
 	}
 	if len(svc.Compartments) != 0 {
-		t.Fatalf("agentd compartments = %v, want none — create_task requires none, and a compartment here is one every run can reach", svc.Compartments)
+		t.Fatalf("agentd compartments = %v, want none — neither tool requires one, and a compartment here is one every run can reach", svc.Compartments)
 	}
 	// SCOPED, and to exactly one set. An absent tool_sets would mean EVERY set
 	// to garmd, and for the platform's one runner that is every
-	// CLEARANCE_PUBLIC, uncompartmented, VERB_WRITE tool in whatever catalogue
-	// is mounted — reachable by every run it executes. `escalation` is the set
-	// create_task was moved into (contracts v0.8.0).
+	// CLEARANCE_PUBLIC, uncompartmented, VERB_READ or VERB_WRITE tool in whatever
+	// catalogue is mounted — reachable by every run it executes. `escalation` is
+	// the set create_task was moved into (contracts v0.8.0), and it now holds
+	// get_task_grant beside it: opening an escalation and collecting its answer
+	// are two halves of one act.
 	if !sameSet(svc.ToolSets, []string{"escalation"}) {
 		t.Fatalf("agentd tool_sets = %v, want exactly [escalation] — absent would make the runner unscoped", svc.ToolSets)
 	}

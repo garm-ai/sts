@@ -53,14 +53,32 @@ agents:
 # there is at least one verb); the rest is on review.
 services:
   # The agent runner (garm-ai/agentd), minting for itself so a parked run can
-  # open an approval task. It opens ONE tool — garm.tasks.v1.create_task,
-  # which declares verb: VERB_WRITE, min_clearance: CLEARANCE_PUBLIC and no
-  # compartments — so that is exactly, and only, what it holds. This
-  # principal is the whole platform's runner: anything extra it carries,
-  # every run can reach.
+  # open an approval task and collect the answer. It reaches TWO tools —
+  # garm.tasks.v1.create_task, verb: VERB_WRITE, and
+  # garm.tasks.v1.get_task_grant, verb: VERB_READ, both CLEARANCE_PUBLIC with no
+  # compartments — so that is exactly, and only, what it holds. This principal
+  # is the whole platform's runner: anything extra it carries, every run can
+  # reach.
   agentd:
     clearance: PUBLIC
-    verbs: [WRITE]
+    # READ AS WELL AS WRITE, since `garm.tasks.v1` grew a read back for the grant
+    # (the amendment of 2026-10-01). `get_task_grant` is how a parked run collects
+    # the approval its decision minted: the decided event carries a task id and an
+    # outcome and never the grant, because a bearer on a stream is readable by
+    # anything that can consume the subject. That method declares verb: VERB_READ,
+    # which is what the call does — it returns a value and moves nothing — so the
+    # policy follows the act, rather than the method being relabelled WRITE to fit
+    # this line as it stood.
+    #
+    # WIDENING IS BOUNDED BY THE SET AND NOT BY THE VERB. This principal is
+    # scoped to `tool_sets: [escalation]` below, and that set holds exactly
+    # `garm.tasks.v1.create_task` and `garm.tasks.v1.get_task_grant` — verified
+    # against the descriptor, not the documentation — and no other contract in
+    # this platform declares a set by that name. So READ here reaches one more
+    # tool and not every CLEARANCE_PUBLIC, uncompartmented, VERB_READ tool in the
+    # catalogue. Remove the scope and that sentence stops being true in both
+    # verbs at once, which is the thing to notice about this pair of lines.
+    verbs: [READ, WRITE]
     # SCOPED, and scoped to one set. `escalation` is the set
     # garm.tasks.v1.create_task was moved into (contracts v0.8.0): it is named
     # for the act and not for the caller, because a set named after who holds
