@@ -49,6 +49,13 @@ segments:
 agents:
   order-assistant: { roles: [support-desk] }
   write-bot:       { roles: [write-only] }
+
+# The service principal of decisions/2026-09-30-a-service-calls-on-its-own-
+# behalf: its authority inline, no tool sets (absent means unscoped, which is
+# what reaching a set-less tool takes), and WRITE so the verb intersection
+# against write-bot is not empty.
+services:
+  agentd: { clearance: PUBLIC, verbs: [WRITE] }
 `
 
 // fakeAuthz is a hand-rolled Authorizer: the four relations as plain maps,
@@ -184,7 +191,14 @@ func newFixture(t *testing.T, policyYAML string, authz *fakeAuthz, instance sts.
 	policy := loadPolicy(t, policyYAML)
 
 	clientKey := genUpstreamKey(t)
-	clients := newTestRegistry(t, nowFn, sts.ClientConfig{ID: "shop-bff", PEMs: [][]byte{clientPublicKeyPEM(t, clientKey)}})
+	// Two registered clients, one key: "shop-bff" is the BFF every other
+	// test authenticates as, and "agentd" is the runner the service-principal
+	// tests need — the service identity is derived from the AUTHENTICATED
+	// client id, so a test about service:agentd has to actually authenticate
+	// as agentd.
+	clients := newTestRegistry(t, nowFn,
+		sts.ClientConfig{ID: "shop-bff", PEMs: [][]byte{clientPublicKeyPEM(t, clientKey)}},
+		sts.ClientConfig{ID: "agentd", PEMs: [][]byte{clientPublicKeyPEM(t, clientKey)}})
 
 	kr, err := sts.NewKeyring([]sts.KeyConfig{{KID: "k1", PEM: testKeyPEM(t)}}, "k1")
 	if err != nil {
@@ -279,9 +293,17 @@ func (f *fixture) form(subjectToken, requestedSubject, agent string) url.Values 
 // assertion and the governed door's fields, and deliberately NO
 // subject_token — its absence is half of what selects this exchange.
 func (f *fixture) form2(onBehalfOf, subjectKind, agent, tenant string) url.Values {
+	return f.form2As("shop-bff", onBehalfOf, subjectKind, agent, tenant)
+}
+
+// form2As is form2 authenticating as a named registered client. Which client
+// a request authenticates as is load-bearing on the governed door — it is
+// where both "runner:" and, for a SERVICE subject, "service:" come from —
+// so a test about either has to be able to choose it.
+func (f *fixture) form2As(clientID, onBehalfOf, subjectKind, agent, tenant string) url.Values {
 	v := url.Values{}
 	v.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
-	v.Set("client_assertion", clientAssertion(f.t, f.clientKey, "shop-bff", testAudience, f.now.Add(time.Minute), nextJTI()))
+	v.Set("client_assertion", clientAssertion(f.t, f.clientKey, clientID, testAudience, f.now.Add(time.Minute), nextJTI()))
 	v.Set("on_behalf_of", onBehalfOf)
 	v.Set("subject_kind", subjectKind)
 	v.Set("agent", agent)
@@ -822,7 +844,9 @@ func (f *fixture) verifierOf(t *testing.T, _ string) *sts.Verifier {
 func (f *fixture) clientsOf(t *testing.T) *sts.ClientRegistry {
 	t.Helper()
 	nowFn := func() time.Time { return f.now }
-	return newTestRegistry(t, nowFn, sts.ClientConfig{ID: "shop-bff", PEMs: [][]byte{clientPublicKeyPEM(t, f.clientKey)}})
+	return newTestRegistry(t, nowFn,
+		sts.ClientConfig{ID: "shop-bff", PEMs: [][]byte{clientPublicKeyPEM(t, f.clientKey)}},
+		sts.ClientConfig{ID: "agentd", PEMs: [][]byte{clientPublicKeyPEM(t, f.clientKey)}})
 }
 
 // --- fail closed and opaquely ---------------------------------------------
@@ -1210,8 +1234,12 @@ func TestExchange2RefusalsAreOpaqueAndComplete(t *testing.T) {
 	badKind := good()
 	badKind.Set("subject_kind", "AGENT")
 
-	serviceKind := good()
-	serviceKind.Set("subject_kind", "SERVICE")
+	// subject_kind SERVICE over a USER's on_behalf_of. A runner must not be
+	// able to turn a person into a service principal by relabelling the
+	// kind: the service a SERVICE mint is for is the client that
+	// authenticated, never a name in the body.
+	serviceKindOverAUser := good()
+	serviceKindOverAUser.Set("subject_kind", "SERVICE")
 
 	noTenant := good()
 	noTenant.Del("tenant")
@@ -1226,16 +1254,16 @@ func TestExchange2RefusalsAreOpaqueAndComplete(t *testing.T) {
 	wrongGrantType.Set("grant_type", "authorization_code")
 
 	scenarios := map[string]url.Values{
-		"no can_run tuple for this runner and agent": noCanRun,
-		"no can_invoke tuple for the named subject":  noCanInvoke,
-		"the runner presented an act chain":          presentedAct,
-		"the runner presented a requested_subject":   presentedRequestedSubject,
-		"subject_kind is neither USER nor SERVICE":   badKind,
-		"subject_kind SERVICE":                       serviceKind,
-		"no tenant":                                  noTenant,
-		"no agent":                                   noAgent,
-		"client assertion does not verify":           badAssertion,
-		"wrong grant_type":                           wrongGrantType,
+		"no can_run tuple for this runner and agent":    noCanRun,
+		"no can_invoke tuple for the named subject":     noCanInvoke,
+		"the runner presented an act chain":             presentedAct,
+		"the runner presented a requested_subject":      presentedRequestedSubject,
+		"subject_kind is neither USER nor SERVICE":      badKind,
+		"subject_kind SERVICE over a user on_behalf_of": serviceKindOverAUser,
+		"no tenant":                        noTenant,
+		"no agent":                         noAgent,
+		"client assertion does not verify": badAssertion,
+		"wrong grant_type":                 wrongGrantType,
 	}
 
 	for name, form := range scenarios {
@@ -1425,4 +1453,169 @@ func TestExchange2AsksCanRunBeforeCanInvokeAndNeverProbesOnADeniedRun(t *testing
 			t.Fatalf("InSegment was asked (%q) after CanRun denied; the exchange should have stopped at the gate.\ncalls: %v", calls[i], calls)
 		}
 	})
+}
+
+// --- the service principal ------------------------------------------------
+
+// The mint tasksd's Create needs: Kind PRINCIPAL_KIND_SERVICE *and*
+// HasAgent(). Both halves come from this one exchange — devkit refuses an
+// `act` chain at mint time on a service token (a service calls as itself and
+// the chain is added per call), so if this door did not add it, nothing
+// would, and `create_task` would be unreachable to every caller in the
+// platform.
+func TestExchange2MintsAServicePrincipalCarryingAnAgentChain(t *testing.T) {
+	authz := newFakeAuthz()
+	// can_run only. No can_invoke tuple is written for the service, and the
+	// absence is deliberate — see the assertion on the call log below.
+	authz.allowRun("runner:agentd", "agent:write-bot")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	claims := f.mint(f.form2As("agentd", "service:agentd", "SERVICE", "write-bot", "acme"))
+
+	if got := str(claims, "sub"); got != "service:agentd" {
+		t.Errorf("sub = %q, want service:agentd — the service calls on its own behalf", got)
+	}
+
+	garm, ok := claims["garm"].(map[string]any)
+	if !ok {
+		t.Fatal("no garm claim on the sub level")
+	}
+	// garmd reads the kind from garm.kind through normaliseKind, which maps
+	// anything it does not recognise to the EMPTY STRING with no error. So
+	// this asserts the exact spelling: a token minted with "svc" would
+	// verify, carry no kind at all, and be refused by tasksd for the one
+	// reason that looks like a tasksd bug.
+	if got := str(garm, "kind"); got != "SERVICE" {
+		t.Errorf("garm.kind = %q, want SERVICE — normaliseKind maps that to PRINCIPAL_KIND_SERVICE; an unrecognised value silently becomes \"\"", got)
+	}
+	if got := str(garm, "clearance"); got != "PUBLIC" {
+		t.Errorf("garm.clearance = %q, want the declared PUBLIC", got)
+	}
+	if !sliceEqual(strSlice(garm, "verbs"), []string{"WRITE"}) {
+		t.Errorf("garm.verbs = %v, want [WRITE] as declared", strSlice(garm, "verbs"))
+	}
+	// Unscoped: create_task declares no tool set, and garmd refuses a SCOPED
+	// caller any tool in no set. An empty list here would read as "no set at
+	// all" and close the path this mint exists to open.
+	if _, present := garm["tool_sets"]; present {
+		t.Errorf("garm.tool_sets is present (%#v); a service that names none must be unscoped, and only an absent claim says that", garm["tool_sets"])
+	}
+
+	// The act chain — the HasAgent() half of tasksd's gate.
+	act, ok := claims["act"].(map[string]any)
+	if !ok {
+		t.Fatal("no act level; tasksd's Create requires Kind SERVICE *and* HasAgent(), and devkit will not add the chain at mint time")
+	}
+	if got := str(act, "sub"); got != "agent:write-bot" {
+		t.Errorf("act.sub = %q, want agent:write-bot — the agent the caller named", got)
+	}
+	actGarm, ok := act["garm"].(map[string]any)
+	if !ok {
+		t.Fatal("the act level carries no garm claim; garmd's ParseClaims refuses the whole token")
+	}
+	if got := str(actGarm, "kind"); got != "AGENT" {
+		t.Errorf("act.garm.kind = %q, want AGENT", got)
+	}
+	if _, nested := act["act"]; nested {
+		t.Error("act carries a nested act; a service mint is depth two — the service at sub, the agent at act")
+	}
+
+	// Provenance is still the runner, and still exec rather than an act link.
+	exec, ok := claims["exec"].(map[string]any)
+	if !ok {
+		t.Fatal("no exec claim; the governed door records WHICH runner obtained the token")
+	}
+	if got := str(exec, "sub"); got != "runner:agentd" {
+		t.Errorf("exec.sub = %q, want runner:agentd", got)
+	}
+
+	// can_invoke is NOT asked of a service, and that is a design decision
+	// rather than an omission: the production model derives can_invoke from
+	// segment membership (deploy/model.fga, `invokable_by: [segment#member]`,
+	// members being customers and employees), so "service:agentd" is a user
+	// no tuple set can answer yes for. Asking it would deny every service
+	// mint on the OpenFGA authorizer while passing here against a fake that
+	// was told to allow it — green in CI, dead in production.
+	for _, c := range authz.recorded() {
+		if strings.HasPrefix(c, "CanInvoke(") {
+			t.Errorf("asked %s; can_invoke is a person's entitlement and the production model cannot answer it for a service", c)
+		}
+		if strings.HasPrefix(c, "InSegment(") {
+			t.Errorf("asked %s; a service is not segment-matched — it is one identity with one declared authority", c)
+		}
+	}
+	if firstCallTo(authz.recorded(), "CanRun") < 0 {
+		t.Error("never asked CanRun; it is the only relationship standing between a runner and a service mint")
+	}
+}
+
+// The negative half, without which the positive half proves nothing.
+//
+// Every row is refused, and every row is refused IDENTICALLY — an undeclared
+// service must not be distinguishable from one that is declared but not the
+// caller's, or this door becomes an oracle for which services a deployment
+// runs.
+func TestExchange2RefusesAServiceSubjectItCannotJustify(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowRun("runner:agentd", "agent:write-bot")
+	authz.allowRun("runner:shop-bff", "agent:write-bot")
+	// Written deliberately: a service that passed can_invoke would still have
+	// to be declared AND be the authenticated client, so these tuples must
+	// not rescue any row below.
+	authz.allowInvoke("service:agentd", "agent:write-bot")
+	authz.allowInvoke("service:ghost", "agent:write-bot")
+	authz.allowInvoke("service:shop-bff", "agent:write-bot")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	cases := map[string]url.Values{
+		// Declared in the policy, but the caller authenticated as somebody
+		// else. Without this check, any client holding any registered key
+		// could mint any declared service's authority.
+		"a service the caller did not authenticate as": f.form2As("shop-bff", "service:agentd", "SERVICE", "write-bot", "acme"),
+		// The caller IS who it says, and the policy has never heard of it.
+		"an undeclared service": f.form2As("shop-bff", "service:shop-bff", "SERVICE", "write-bot", "acme"),
+		// Neither declared nor the caller.
+		"a service nobody has heard of": f.form2As("agentd", "service:ghost", "SERVICE", "write-bot", "acme"),
+		// A service subject on the USER path, and a user subject on the
+		// SERVICE path: subject_kind and the prefix must agree.
+		"service identity under subject_kind USER": f.form2As("agentd", "service:agentd", "USER", "write-bot", "acme"),
+		"bare service name, no prefix":             f.form2As("agentd", "agentd", "SERVICE", "write-bot", "acme"),
+		"doubled prefix":                           f.form2As("agentd", "service:service:agentd", "SERVICE", "write-bot", "acme"),
+		"empty service name":                       f.form2As("agentd", "service:", "SERVICE", "write-bot", "acme"),
+	}
+
+	for name, form := range cases {
+		t.Run(name, func(t *testing.T) {
+			resp := f.do(form)
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			if got := strings.TrimSpace(string(body)); got != `{"error":"access_denied"}` {
+				t.Fatalf("body = %q, want the single opaque denial; a body that varies with the reason tells a caller which services exist", got)
+			}
+		})
+	}
+
+	// And the one request that SHOULD mint still does, so the rows above are
+	// refused for their own reason rather than because the service path never
+	// worked.
+	if resp := f.do(f.form2As("agentd", "service:agentd", "SERVICE", "write-bot", "acme")); resp.StatusCode != http.StatusOK {
+		t.Fatalf("the justified service mint was refused with %d; every row above proves nothing", resp.StatusCode)
+	}
+}
+
+// A service's own clearance and verbs are the ceiling, and the agent's are
+// the other half of the fold — so a service with WRITE acting as an agent
+// with only READ mints nothing. Minting it would hand garmd a token whose
+// chain intersects to no verb at all, which it refuses, and the operator
+// reads that as a garmd fault rather than a policy that never agreed.
+func TestExchange2RefusesAServiceWhoseVerbsMissTheAgentsEntirely(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowRun("runner:agentd", "agent:order-assistant") // READ only
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	if resp := f.do(f.form2As("agentd", "service:agentd", "SERVICE", "order-assistant", "acme")); resp.StatusCode == http.StatusOK {
+		t.Fatal("minted a service token whose verb intersection with the agent is empty")
+	}
 }

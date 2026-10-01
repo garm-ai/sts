@@ -312,6 +312,31 @@ func TestDeployClaimsYAMLExampleLoadsAndStaysInSync(t *testing.T) {
 	if !sameSet(c.Compartments, []string{"pii-contact", "financial"}) {
 		t.Fatalf("retail-vip compartments = %v, want [pii-contact financial]", c.Compartments)
 	}
+
+	// The worked `services:` entry. It is the only declaration in the
+	// repository that lets a runner open a task at all, so a hand-edit that
+	// widens it — a compartment, a higher clearance, a verb beyond WRITE —
+	// fails here rather than shipping. The whole platform's runner holds
+	// this, and every run can reach whatever it holds.
+	svc, err := p.ForService("agentd")
+	if err != nil {
+		t.Fatalf("deploy/claims.yaml declares no agentd service: %v", err)
+	}
+	if svc.Kind != "SERVICE" {
+		t.Fatalf("agentd kind = %q, want SERVICE", svc.Kind)
+	}
+	if svc.Clearance != "PUBLIC" {
+		t.Fatalf("agentd clearance = %q, want PUBLIC — create_task declares min_clearance CLEARANCE_PUBLIC and nothing higher is warranted", svc.Clearance)
+	}
+	if !sameSet(svc.Verbs, []string{"WRITE"}) {
+		t.Fatalf("agentd verbs = %v, want exactly [WRITE]", svc.Verbs)
+	}
+	if len(svc.Compartments) != 0 {
+		t.Fatalf("agentd compartments = %v, want none — create_task requires none, and a compartment here is one every run can reach", svc.Compartments)
+	}
+	if svc.ToolSets != nil {
+		t.Fatalf("agentd tool_sets = %v, want absent until create_task's own set exists; a scoped caller cannot reach a set-less tool", svc.ToolSets)
+	}
 }
 
 func TestSegmentsReturnsDeclaredSegmentsSorted(t *testing.T) {
@@ -407,6 +432,145 @@ func TestApproverAuthorityFromClaimsRefusesAnEmptyOrUnknownClearance(t *testing.
 		t.Run(name, func(t *testing.T) {
 			if _, err := sts.ApproverAuthorityFromClaims(raw); err == nil {
 				t.Fatal("got nil error; an approver asserting no usable authority must be refused here")
+			}
+		})
+	}
+}
+
+// --- services ------------------------------------------------------------
+
+// servicePolicy declares one service beside the agents, with the shape the
+// `services:` block is meant to have: its authority written INLINE, and no
+// tool_sets — absent means unscoped, which is what reaching a set-less tool
+// (garm.tasks.v1.create_task declares no sets) requires.
+const servicePolicy = `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+segments:
+  cust: { kind: customer, roles: [r1] }
+agents:
+  a1: { roles: [r1] }
+services:
+  agentd: { clearance: PUBLIC, verbs: [WRITE] }
+  artefactd-writer: { clearance: RESTRICTED, compartments: [card-data, generated-artefacts], verbs: [WRITE], tool_sets: [artefacts] }
+`
+
+func TestForServiceMintsTheDeclaredAuthorityAsKindService(t *testing.T) {
+	p := loadPolicy(t, servicePolicy)
+
+	c, err := p.ForService("artefactd-writer")
+	if err != nil {
+		t.Fatalf("ForService: %v", err)
+	}
+	// "SERVICE" and not "service" or "PRINCIPAL_KIND_SERVICE": garmd's
+	// normaliseKind accepts all three, but it maps anything it does NOT
+	// recognise to the empty string SILENTLY, so what this mints has to be
+	// a value that round-trips rather than one that reads plausibly.
+	if c.Kind != "SERVICE" {
+		t.Errorf("kind = %q, want SERVICE — garmd's normaliseKind maps it to PRINCIPAL_KIND_SERVICE, and an unrecognised kind becomes \"\" with no error", c.Kind)
+	}
+	if c.Clearance != "RESTRICTED" {
+		t.Errorf("clearance = %q, want RESTRICTED as declared", c.Clearance)
+	}
+	if !sameSet(c.Compartments, []string{"card-data", "generated-artefacts"}) {
+		t.Errorf("compartments = %v, want the declared pair", c.Compartments)
+	}
+	if !sameSet(c.Verbs, []string{"WRITE"}) {
+		t.Errorf("verbs = %v, want [WRITE]", c.Verbs)
+	}
+	if !sameSet(c.ToolSets, []string{"artefacts"}) {
+		t.Errorf("tool_sets = %v, want [artefacts]", c.ToolSets)
+	}
+
+	// A service that names no tool sets is UNSCOPED, and that must arrive as
+	// nil rather than an empty slice: garmd reads nil ToolSets as "every
+	// set" and an empty one as "no set at all", so the difference decides
+	// whether a set-less tool is reachable.
+	unscoped, err := p.ForService("agentd")
+	if err != nil {
+		t.Fatalf("ForService(agentd): %v", err)
+	}
+	if unscoped.ToolSets != nil {
+		t.Errorf("tool_sets = %#v, want nil — absent means unscoped, and only nil says that", unscoped.ToolSets)
+	}
+}
+
+// An undeclared service has no authority to mint, exactly as an undeclared
+// agent has none. It must fail here rather than mint an empty claim: a claim
+// with no clearance is one garmd's ParseClaims refuses, and the operator
+// would read that as a verifier problem rather than a missing policy entry.
+func TestForServiceRefusesAnUndeclaredService(t *testing.T) {
+	p := loadPolicy(t, servicePolicy)
+	if _, err := p.ForService("ghost"); err == nil {
+		t.Fatal("ForService accepted a service the policy never declares")
+	}
+}
+
+func TestLoadPolicyRejectsUnusableServiceBlocks(t *testing.T) {
+	cases := map[string]string{
+		// A typo'd key inside a service entry is the same failure
+		// TestLoadPolicyRejectsUnknownFieldInRole guards in a role, and it
+		// is WORSE here: `garm claims check` reads only `roles:`, so
+		// nothing downstream looks at a service's names at all.
+		"unknown field in a service": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+services:
+  s: { clerance: PUBLIC, verbs: [WRITE] }
+`,
+		"service with no clearance": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+services:
+  s: { verbs: [WRITE] }
+`,
+		"service with an unknown clearance name": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+services:
+  s: { clearance: TOP_SECRET, verbs: [WRITE] }
+`,
+		// A service with no verbs reaches no tool: the exchange refuses an
+		// empty verb intersection over the chain, so this would load and
+		// then deny every mint, which is a policy bug an operator should
+		// read at startup.
+		"service with no verbs": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+services:
+  s: { clearance: PUBLIC }
+`,
+		// A service's NAME is bare. The exchange looks it up by the
+		// authenticated client id and mints "service:" + that, so a key
+		// written with the prefix already on it is the doubled identity
+		// ("service:service:agentd") nothing matches — and it would read
+		// back as an undeclared service, which is a long way from the
+		// mistake.
+		"service key carrying a kind prefix": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+services:
+  service:agentd: { clearance: PUBLIC, verbs: [WRITE] }
+`,
+		// A service names its authority inline; it does not name roles. A
+		// `roles:` key here is somebody writing the other shape, and
+		// accepting it silently would grant nothing at all.
+		"service naming roles": `
+roles:
+  r1: { clearance: PUBLIC, verbs: [READ] }
+services:
+  s: { roles: [r1] }
+`,
+	}
+
+	for name, yamlContent := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "claims.yaml")
+			if err := os.WriteFile(path, []byte(yamlContent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sts.LoadPolicy(path); err == nil {
+				t.Fatalf("LoadPolicy accepted an unusable service block (%s); it must fail at load, not at mint", name)
 			}
 		})
 	}

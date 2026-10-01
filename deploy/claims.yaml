@@ -36,3 +36,42 @@ segments:
 # never here.
 agents:
   order-assistant: { roles: [support-desk] }
+
+# A SERVICE's own authority: one identity, one declaration, written INLINE
+# rather than as a list of roles. claims.go's ForService says why that shape —
+# in one line, a role sits in a namespace a `segments:` entry can reach into,
+# and one line there would hand a service's grant to a whole population.
+#
+# The key IS the client id the service authenticates as (see `clients:` in
+# deploy/config.yaml). The governed door reads WHICH service a SERVICE mint is
+# for off the authenticated client assertion and refuses an `on_behalf_of`
+# naming any other, so renaming a client there renames the service here.
+#
+# Note what does NOT check this block: `garm claims check` reads only
+# `roles:`, so a compartment or tool set misspelled below reaches no gate.
+# LoadPolicy checks what it can locally (the clearance vocabulary, and that
+# there is at least one verb); the rest is on review.
+services:
+  # The agent runner (garm-ai/agentd), minting for itself so a parked run can
+  # open an approval task. It opens ONE tool — garm.tasks.v1.create_task,
+  # which declares verb: VERB_WRITE, min_clearance: CLEARANCE_PUBLIC and no
+  # compartments — so that is exactly, and only, what it holds. This
+  # principal is the whole platform's runner: anything extra it carries,
+  # every run can reach.
+  agentd:
+    clearance: PUBLIC
+    verbs: [WRITE]
+    # TODO(toolset): create_task is being moved into a dedicated tool set in
+    # garm-ai/contracts. When that set has a name it goes HERE, as
+    # `tool_sets: [<name>]`, and this service stops being unscoped. Until
+    # then tool_sets is absent on purpose — garmd reads absent as every set,
+    # and create_task declares no set today, which a SCOPED caller cannot
+    # reach at all. The name is not guessed: a tool set the catalogue does
+    # not declare makes every mint for this service reach nothing, and since
+    # `garm claims check` does not read this block, nothing would catch it.
+    #
+    # Also not yet exercisable end to end HERE: garmd folds sub ∩ act, so the
+    # agent the runner names in the chain must itself carry WRITE, and the
+    # only agent this repository declares (order-assistant, above) is
+    # READ-only. The declaration is correct; the dev policy has no write
+    # agent to pair it with yet.
