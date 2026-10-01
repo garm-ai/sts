@@ -398,7 +398,13 @@ type exchangeRequest struct {
 // string already names a kind": the two doors disagreeing about that was a
 // real defect, where exchange 1 would mint an "employee:customer:C-1" that
 // exchange 2 refuses outright.
-var knownKindPrefixes = []string{"customer:", "employee:", "agent:", "runner:"}
+//
+// "service:" is in it for both reasons the others are. It is a kind this
+// service mints (the governed door's SERVICE subject), and leaving it out
+// made "customer:service:x" a well-formed customer identity to
+// segmentKindFromIdentity and "service:x" from an employee IdP mint as
+// "employee:service:x" — the doubled identity no tuple names.
+var knownKindPrefixes = []string{"customer:", "employee:", "agent:", "runner:", "service:"}
 
 // startsWithKnownKind reports whether identity opens with one of them.
 func startsWithKnownKind(identity string) bool {
@@ -575,22 +581,43 @@ func (s *Server) exchange2(ctx context.Context, req exchange2Request) (string, t
 	}
 	agentIdentity := "agent:" + req.agent
 
-	subKind, ok := segmentKindFromIdentity(req.onBehalfOf)
-	if !ok {
-		s.deny(ctx, "on_behalf_of is not a type-prefixed customer or employee identity",
-			"client", clientID, "on_behalf_of", req.onBehalfOf)
-		return "", 0, errDenied
-	}
-
+	// subject_kind decides what on_behalf_of MEANS, so it is read before the
+	// identity is interpreted rather than after: the same field names a
+	// segment-matched person under USER and a declared service under
+	// SERVICE, and parsing it one way first refuses the other outright —
+	// which is exactly how SERVICE used to be unreachable.
+	var subKind, serviceName string
 	switch req.subjectKind {
 	case "USER":
-		// The only kind the claims policy can resolve: ForSegments always
-		// mints Kind "USER" (claims.go), and both customers and employees
-		// are users to garm.
+		// ForSegments always mints Kind "USER" (claims.go), and both
+		// customers and employees are users to garm.
+		k, ok := segmentKindFromIdentity(req.onBehalfOf)
+		if !ok {
+			s.deny(ctx, "on_behalf_of is not a type-prefixed customer or employee identity",
+				"client", clientID, "on_behalf_of", req.onBehalfOf)
+			return "", 0, errDenied
+		}
+		subKind = k
 	case "SERVICE":
-		s.deny(ctx, "subject_kind SERVICE has no claims-policy path in this version",
-			"client", clientID, "on_behalf_of", req.onBehalfOf)
-		return "", 0, errDenied
+		// A service calls on its own behalf
+		// (decisions/2026-09-30-a-service-calls-on-its-own-behalf.md), and
+		// WHICH service is read off the client credential — never off a form
+		// field. on_behalf_of must name the service the caller
+		// authenticated as, so the policy's `services:` keys ARE client ids.
+		//
+		// Honouring any other name would hand every declared service's
+		// authority to anyone holding ANY registered client key: a BFF could
+		// ask for artefactd-writer's RESTRICTED write clearance, and the
+		// minted token would look exactly like artefactd asking for it, in
+		// the ledger and everywhere else. It is refused rather than quietly
+		// replaced with the right name, because a caller that named a
+		// different service has already diverged from what this door will do.
+		if req.onBehalfOf != "service:"+clientID {
+			s.deny(ctx, "a SERVICE subject may only be the client that authenticated as it",
+				"client", clientID, "on_behalf_of", req.onBehalfOf)
+			return "", 0, errDenied
+		}
+		serviceName = clientID
 	default:
 		s.deny(ctx, "subject_kind must be USER or SERVICE", "client", clientID, "subject_kind", req.subjectKind)
 		return "", 0, errDenied
@@ -606,7 +633,7 @@ func (s *Server) exchange2(ctx context.Context, req exchange2Request) (string, t
 	}
 
 	// Step 2 (program plan §3.9): may this runner execute this agent?
-	ok, err = s.authz.CanRun(ctx, runnerIdentity, agentIdentity)
+	ok, err := s.authz.CanRun(ctx, runnerIdentity, agentIdentity)
 	if err != nil {
 		s.deny(ctx, "can_run check failed", "runner", runnerIdentity, "agent", agentIdentity, "err", err)
 		return "", 0, errDenied
@@ -617,15 +644,28 @@ func (s *Server) exchange2(ctx context.Context, req exchange2Request) (string, t
 	}
 
 	// Step 3: can_invoke, the same question exchange 1 asks, asked of the
-	// subject the runner named.
-	ok, err = s.authz.CanInvoke(ctx, req.onBehalfOf, agentIdentity)
-	if err != nil {
-		s.deny(ctx, "can_invoke check failed", "principal", req.onBehalfOf, "agent", agentIdentity, "err", err)
-		return "", 0, errDenied
-	}
-	if !ok {
-		s.deny(ctx, "principal may not invoke agent", "principal", req.onBehalfOf, "agent", agentIdentity)
-		return "", 0, errDenied
+	// subject the runner named — for a USER subject only.
+	//
+	// A SERVICE subject is deliberately not asked, and the reason is in
+	// deploy/model.fga: can_invoke is DERIVED there from segment membership
+	// (`invokable_by: [segment#member]`, and a segment's members are
+	// customers and employees), so "service:agentd" is a user no tuple set
+	// can answer yes for. Asking it anyway would deny every service mint on
+	// the production authorizer while passing in CI against a static file
+	// that was simply told to allow it — a path that is green here and dead
+	// there. What stands in its place is not weaker: the service is the
+	// AUTHENTICATED client, and can_run above already says this runner may
+	// execute this agent.
+	if serviceName == "" {
+		ok, err = s.authz.CanInvoke(ctx, req.onBehalfOf, agentIdentity)
+		if err != nil {
+			s.deny(ctx, "can_invoke check failed", "principal", req.onBehalfOf, "agent", agentIdentity, "err", err)
+			return "", 0, errDenied
+		}
+		if !ok {
+			s.deny(ctx, "principal may not invoke agent", "principal", req.onBehalfOf, "agent", agentIdentity)
+			return "", 0, errDenied
+		}
 	}
 
 	// It never trusts a garm claim the runner presents: there is no field
@@ -634,6 +674,7 @@ func (s *Server) exchange2(ctx context.Context, req exchange2Request) (string, t
 	return s.resolveAndMint(ctx, mintInputs{
 		subIdentity: req.onBehalfOf,
 		subKind:     subKind,
+		service:     serviceName,
 		tenant:      req.tenant,
 		agent:       req.agent,
 		exec:        &execClaimJSON{Subject: runnerIdentity, Issuer: s.issuer},
@@ -654,8 +695,15 @@ type mintInputs struct {
 
 	// subKind is the CLAIMS-POLICY segment kind, "customer" or "employee" —
 	// not garm's PrincipalKind vocabulary, which is always USER for a
-	// segment-resolved claim (claims.go's validSegmentKinds).
+	// segment-resolved claim (claims.go's validSegmentKinds). Empty when the
+	// sub is a service, which belongs to no segment.
 	subKind string
+
+	// service is the BARE service name when sub is a SERVICE principal, ""
+	// otherwise. It is the one field that decides which half of
+	// resolveAndMint's step 6 runs, because a service's authority is
+	// DECLARED and a person's is resolved from membership.
+	service string
 
 	tenant string
 
@@ -809,11 +857,42 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 func (s *Server) resolveAndMint(ctx context.Context, in mintInputs) (string, time.Duration, error) {
 	mintingForAgent := in.agent != ""
 
-	// Step 6: segment membership, feeding step 7's claims resolution.
-	subClaim, err := s.resolveSegmentClaim(ctx, in.subIdentity, in.subKind)
-	if err != nil {
-		s.deny(ctx, "sub principal resolves to no roles", "principal", in.subIdentity, "kind", in.subKind, "err", err)
-		return "", 0, errDenied
+	// Step 6: who the sub is allowed to be.
+	//
+	// Two resolutions, and which one runs is the difference between the two
+	// kinds of principal rather than a shortcut. A person's authority comes
+	// from MEMBERSHIP — N InSegment questions against a store this service
+	// does not own. A service's comes from a DECLARATION: one identity, one
+	// authority, written in the deployment's claims policy, with no
+	// membership to ask about and nothing to union.
+	var subClaim *GarmClaim
+	var err error
+	if in.service != "" {
+		subClaim, err = s.policy.ForService(in.service)
+		if err != nil {
+			// An undeclared service is refused here, and the caller cannot
+			// tell that from any other refusal: deniedBody is the one body
+			// this service returns, so this is not an oracle for which
+			// services a deployment declares.
+			s.deny(ctx, "service resolves to no declared authority", "service", in.service, "err", err)
+			return "", 0, errDenied
+		}
+		if !mintingForAgent {
+			// Unreachable: exchange2 refuses a request naming no agent, and
+			// exchange 1 never produces a service sub. Refused here anyway,
+			// because a service token with no act chain is the one shape
+			// tasksd's Create rejects outright (it requires Kind SERVICE
+			// *and* HasAgent()), and minting one would look like a tasksd
+			// bug rather than a token that was never valid for the call.
+			s.deny(ctx, "a service mint names no agent; a service token with no act chain is one the task service refuses", "service", in.service)
+			return "", 0, errDenied
+		}
+	} else {
+		subClaim, err = s.resolveSegmentClaim(ctx, in.subIdentity, in.subKind)
+		if err != nil {
+			s.deny(ctx, "sub principal resolves to no roles", "principal", in.subIdentity, "kind", in.subKind, "err", err)
+			return "", 0, errDenied
+		}
 	}
 
 	// The employee's OWN claim is resolved whenever delegating, whether or

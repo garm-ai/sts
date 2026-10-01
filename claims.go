@@ -73,6 +73,19 @@ type policyAgent struct {
 	roles []string
 }
 
+// policyService is the validated, internal form of a named service's own
+// declared authority.
+//
+// Its fields are a Role's, and the type is deliberately NOT Role: a Role is
+// a bundle something NAMES, and the whole point of declaring a service's
+// authority inline is that nothing can name it. See ForService.
+type policyService struct {
+	clearance    string
+	compartments []string
+	verbs        []string
+	toolSets     []string
+}
+
 // Policy is a loaded, validated claims policy: role definitions, which
 // segments grant which roles, and each agent's own authority. It holds
 // definitions and rules ONLY. Per-principal membership — which segments a
@@ -83,6 +96,7 @@ type Policy struct {
 	roles    map[string]Role
 	segments map[string]policySegment
 	agents   map[string]policyAgent
+	services map[string]policyService
 }
 
 // --- on-disk shape -----------------------------------------------------
@@ -91,6 +105,7 @@ type policyFile struct {
 	Roles    map[string]roleFile    `yaml:"roles"`
 	Segments map[string]segmentFile `yaml:"segments"`
 	Agents   map[string]agentFile   `yaml:"agents"`
+	Services map[string]serviceFile `yaml:"services"`
 }
 
 type roleFile struct {
@@ -107,6 +122,17 @@ type segmentFile struct {
 
 type agentFile struct {
 	Roles []string `yaml:"roles"`
+}
+
+// serviceFile is a service's on-disk shape. It carries no `roles:` key, so
+// the document-wide KnownFields(true) refuses one rather than drop it — a
+// service entry written in the agents: shape would otherwise load granting
+// nothing at all, and read as intentional.
+type serviceFile struct {
+	Clearance    string   `yaml:"clearance"`
+	Compartments []string `yaml:"compartments"`
+	Verbs        []string `yaml:"verbs"`
+	ToolSets     []string `yaml:"tool_sets"`
 }
 
 // LoadPolicy reads and validates a claims policy file. Every validation that
@@ -173,7 +199,41 @@ func LoadPolicy(path string) (*Policy, error) {
 		agents[name] = policyAgent{roles: dedupeSorted(af.Roles)}
 	}
 
-	return &Policy{roles: roles, segments: segments, agents: agents}, nil
+	// A service's authority is declared inline, so the names in it are
+	// checked HERE or nowhere: `garm claims check` reads only the `roles:`
+	// block (garm/internal/claimscheck reads that one key and ignores the
+	// rest of the document on purpose), so a service's compartments and tool
+	// sets never reach the catalogue gate. What can be checked locally is
+	// the vocabulary that has a closed set — the clearance — and the one
+	// shape that loads looking intentional while granting nothing.
+	services := make(map[string]policyService, len(pf.Services))
+	for name, sf := range pf.Services {
+		if startsWithKnownKind(name) {
+			// The exchange mints "service:" + this key. A key that already
+			// carries a kind prefix produces "service:service:agentd",
+			// which matches nothing — and the operator reads it back as an
+			// undeclared service, nowhere near the mistake they made.
+			return nil, fmt.Errorf("claims: service %q is named with a kind prefix; a service's name is bare, and the exchange prefixes it", name)
+		}
+		if _, ok := clearanceOrder[sf.Clearance]; !ok {
+			return nil, fmt.Errorf("claims: service %q has clearance %q, want one of PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED", name, sf.Clearance)
+		}
+		if len(sf.Verbs) == 0 {
+			// A claim with no verbs empties the exchange's verb
+			// intersection over the chain, which denies every mint for this
+			// service. That is a policy bug an operator should read at
+			// startup, not a denial they debug in garmd.
+			return nil, fmt.Errorf("claims: service %q declares no verbs; every mint for it would be refused on an empty verb intersection", name)
+		}
+		services[name] = policyService{
+			clearance:    sf.Clearance,
+			compartments: dedupeSorted(sf.Compartments),
+			verbs:        dedupeSorted(sf.Verbs),
+			toolSets:     dedupeSorted(sf.ToolSets),
+		}
+	}
+
+	return &Policy{roles: roles, segments: segments, agents: agents, services: services}, nil
 }
 
 // Segments returns the declared segment names, sorted. This is a closed,
@@ -258,6 +318,25 @@ func (p *Policy) ForAgent(name string) (*GarmClaim, error) {
 	claim := p.unionOf(roleSet)
 	claim.Kind = "AGENT"
 	return &claim, nil
+}
+
+// ForService resolves the claim for a named service principal.
+//
+// A service is NOT segment-matched: it is one identity with one declared
+// authority. There is no membership question to ask, so an undeclared name
+// is a refusal rather than a claim with nothing in it.
+func (p *Policy) ForService(name string) (*GarmClaim, error) {
+	svc, ok := p.services[name]
+	if !ok {
+		return nil, fmt.Errorf("claims: service %q is not declared in the policy", name)
+	}
+	return &GarmClaim{
+		Clearance:    svc.clearance,
+		Compartments: svc.compartments,
+		Verbs:        svc.verbs,
+		ToolSets:     svc.toolSets,
+		Kind:         "SERVICE",
+	}, nil
 }
 
 // unionOf folds a set of role names into a single claim: the highest

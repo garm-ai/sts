@@ -39,8 +39,8 @@ BFF ────POST /token (client_assertion)────▶ ┌─────
 runner ──POST /token (client_assertion)───▶ │       │
          grant_type=token-exchange          └───────┘
          on_behalf_of=<prefixed subject>       ▲
-         subject_kind=USER  agent=<name>       │
-         tenant=<tenant>                   can_run
+         subject_kind=USER|SERVICE             │
+         agent=<name> tenant=<tenant>      can_run
 ```
 
 `subject_token` selects the direct door and `on_behalf_of` selects the
@@ -59,7 +59,10 @@ identity when an asserted one was asked for, or the reverse.
    is per-issuer configuration (`TrustedIssuer.Kind`), never sniffed from
    the token. **On the governed door** there is no subject token at all:
    the runner names a type-prefixed subject in `on_behalf_of`, and the
-   prefix it carries decides the kind, into a closed set.
+   prefix it carries decides the kind, into a closed set. A `SERVICE`
+   subject is the one case where the subject is not named by the caller at
+   all: it must be `service:<the authenticated client id>`, and anything
+   else is refused — see "A service calls on its own behalf" below.
 3. Four yes/no questions are asked of an `Authorizer` (`authz.go`):
    `CanRun` (may this runner execute this agent — the governed door only,
    and asked *before* any other authorization question), `CanInvoke` (may this
@@ -72,7 +75,9 @@ identity when an asserted one was asked for, or the reverse.
    clearance, a set of compartments, a set of verbs, and optional tool
    sets. Definitions and rules live in that file; *membership* (which of
    potentially millions of customers belongs to which segment) comes from
-   the `Authorizer`, never the policy file.
+   the `Authorizer`, never the policy file. A **service** is the exception
+   to all of that: it belongs to no segment, so its authority is
+   *declared* in the policy's `services:` block and read by `ForService`.
 5. A signed token is minted by `Keyring` (`keyring.go`) with ES256 over
    P-256, and its public keys are served as a JWKS at
    `/.well-known/jwks.json` for `garmd` to verify against. Both doors reach
@@ -144,8 +149,8 @@ under it. This is the one shape "the token shape" below does not show.
 | `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` — **required**; anything else is refused |
 | `client_assertion_type` | `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` — **optional**, but a *different* value is refused rather than ignored (`private_key_jwt` is the only client authentication this service implements, so an absent type is unambiguous; a present one naming something else means the caller and this endpoint have already diverged) |
 | `client_assertion` | **required** — the runner's `private_key_jwt`, see "The client assertion" above |
-| `on_behalf_of` | type-prefixed subject, e.g. `employee:jdoe` — **required**, and its prefix must be `customer:` or `employee:` |
-| `subject_kind` | `USER` — **required**; an absent, empty, or any other value is refused ("subject_kind must be USER or SERVICE"). `SERVICE` is a distinct, named refusal from the same check: the value is recognised but has no claims-policy path in this version. |
+| `on_behalf_of` | type-prefixed subject — **required**. Under `subject_kind=USER` its prefix must be `customer:` or `employee:`; under `subject_kind=SERVICE` it must be exactly `service:<the client id this request authenticated as>` |
+| `subject_kind` | `USER` or `SERVICE` — **required**; an absent, empty, or any other value is refused ("subject_kind must be USER or SERVICE"). It decides what `on_behalf_of` *means*, so it is read before that field is interpreted. |
 | `agent` | bare agent name, e.g. `order-assistant` — **required** |
 | `tenant` | the tenant this run belongs to — **required**, for the same reason the direct door refuses a subject token carrying none |
 
@@ -157,6 +162,44 @@ depth-one chain (the subject at `sub`, the agent at `act`) and a runner
 that was itself delegated has nowhere to go in it, the second because
 `requested_subject` is only ever honoured behind `HandledBy` against a
 verified employee token and this door has no verified anybody.
+
+### A service calls on its own behalf
+
+`subject_kind=SERVICE` mints for a **service principal**: `sub` is
+`service:<name>`, `garm.kind` is `SERVICE`, and the authority is whatever the
+policy's `services:` block declares for that name —
+*inline* (`clearance`, `compartments`, `verbs`, `tool_sets`), not as a list of
+roles. The reason for inline is narrow and worth keeping: a role lives in a
+namespace a `segments:` entry can name, so one line there would hand a
+service's grant to a population, while nothing at all can name a service's
+declaration. `LoadPolicy` refuses an unknown clearance, a service with no
+verbs, and a `roles:` key written there by mistake.
+
+Two things are *not* read from the request:
+
+- **Which service.** It is `service:` + the **authenticated** client id, the
+  same credential `runner:` comes from. An `on_behalf_of` naming any other
+  service is refused, not corrected: honouring it would let any holder of any
+  registered client key mint any declared service's authority, and the token
+  would look exactly like that service asking. So a `services:` key *is* a
+  client id.
+- **The act chain.** A service token still carries one — `act.sub` is
+  `agent:<name>` from the `agent` field, with the agent's own declared claim —
+  because the call it is for is "the runner, acting as agent X". `tasksd`'s
+  `Create` requires `PRINCIPAL_KIND_SERVICE` **and** `HasAgent()`, and
+  `devkit` refuses an `act` chain at mint time on a service token, so if this
+  exchange did not add the chain nothing would.
+
+`can_invoke` is **not** asked of a service subject, and that is deliberate.
+The production model derives it from segment membership
+(`deploy/model.fga`: `invokable_by: [segment#member]`, whose members are
+customers and employees), so no tuple set can answer it yes for
+`service:agentd` — asking it would deny every service mint in production
+while passing in CI against a static file that was told to allow it. What
+stands in its place is the authenticated credential, plus `can_run`.
+
+An undeclared service is refused with the same opaque body as every other
+refusal, so this door is not an oracle for which services a deployment runs.
 
 ### The response
 
@@ -407,11 +450,25 @@ checked:
   `can_run` tuple), but the runner itself is `garm-ai/agentd`, not part of
   this service. It does not execute agents, and it has no view of whether a
   run happened.
-- **`subject_kind: SERVICE`.** The field is accepted and validated, and a
-  `SERVICE` subject is refused: the claims policy resolves authority from
-  segment membership and `ForSegments` always mints `kind: USER`. A service
-  principal has no path through it, and inventing one here would be
-  inventing policy.
+- **A client-credentials grant.** A service principal is minted only on the
+  governed door, where a runner asks for it: there is no `grant_type=
+  client_credentials` here, so a service that wants a token of its own with
+  no run behind it has no endpoint. `subject_kind: SERVICE` is built (see
+  "A service calls on its own behalf"), and that is the half `tasksd`
+  needs — the runner opens the task.
+- **A tool set for the runner's service principal.** `deploy/claims.yaml`
+  declares `agentd` unscoped, because `garm.tasks.v1.create_task` declares
+  no set and `garmd` refuses a *scoped* caller any tool in none. A dedicated
+  set for it is being added in `garm-ai/contracts`; the one place its name
+  goes is marked `TODO(toolset)` in that file.
+- **Any check on a `services:` block's compartment and tool-set names.**
+  `garm claims check` reads only `roles:` (`garm/internal/claimscheck` takes
+  that one key and ignores the rest of the document on purpose), so a name
+  misspelled in a service entry reaches no gate. `LoadPolicy` catches what
+  it can locally — the clearance vocabulary, and a service with no verbs —
+  and the rest is on review. A typo there fails *closed* (a compartment or
+  set nobody declares is authority nobody holds), which is why this is a gap
+  and not a hole.
 - **The NATS auth callout integration** is not part of this service.
 - **Queueing for approvals.** `POST /approve` is stateless: a request
   arrives carrying everything and a grant leaves. Nothing here holds pending
@@ -551,10 +608,15 @@ mysterious failure discovered at the first request:
   supplies — see `deploy/tuples.yaml`'s `can_run` tuples: this repository's
   own example ships **two**, one for `agentd`, the real runner, and one for
   `conformance-client`, the id garmd's identity-conformance job
-  authenticates with). A config with no clients would serve a JWKS and
+  authenticates with). It is also the `service:<id>` a `SERVICE` mint is
+  for, which is why a `services:` key in the claims policy must spell a
+  client id exactly. A config with no clients would serve a JWKS and
   deny every `POST /token` and `POST /approve` as an unknown client, so an
   empty list is a startup failure.
-- `policy` — path to the claims policy file (`LoadPolicy`, `claims.go`).
+- `policy` — path to the claims policy file (`LoadPolicy`, `claims.go`):
+  `roles:`, `segments:`, `agents:` and `services:`. Decoded with
+  `KnownFields(true)`, so a typo'd key anywhere in it — including inside a
+  service entry — is a startup error rather than a silently dropped field.
 - `authz.static` — path to the static authorizer tuples file
   (`LoadStaticAuthorizer`, `authz_static.go`). Used by an **untagged**
   build. Required in every config, since `LoadConfig` does not know which
