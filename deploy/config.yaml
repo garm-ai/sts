@@ -45,12 +45,22 @@ issuers:
     audience: [api://internal-app]
     kind: employee
 
-# BFFs allowed to call POST /token, authenticated with private_key_jwt
-# (RFC 7523). These are PUBLIC keys, not secrets, so — unlike signing keys —
-# they may be given as a file path (below) or inlined directly as PEM text.
+# Services allowed to call POST /token and POST /approve, authenticated with
+# private_key_jwt (RFC 7523). These are PUBLIC keys, not secrets, so — unlike
+# signing keys — they may be given as a file path (below) or inlined directly
+# as PEM text.
 clients:
   - id: shop-bff
     keys: [./clients/shop-bff.pub.pem]
+
+  # The agent runner (garm-ai/agentd). It authenticates exactly as a
+  # BFF does, and is additionally the RUNNER identity the governed door's
+  # can_run tuple names: that identity is "runner:" + this id, derived from
+  # the AUTHENTICATED client and never from a field a caller supplies.
+  # Changing this id means changing deploy/tuples.yaml's can_run tuple and
+  # deploy/tuples.openfga.yaml's runnable_by tuple in the same commit.
+  - id: agentd
+    keys: [./clients/agentd.pub.pem]
 
 # The claims policy: role, segment and agent definitions. Segment MEMBERSHIP
 # (who actually belongs to retail-vip, say) is not here — it comes from the
@@ -89,3 +99,13 @@ authz:
 instanceAuthorization:
   status: absent # "enforced" | "absent" — no default; an operator must say which is true
   unconfinedCeiling: PUBLIC # read only while status is absent; empty would refuse every customer-kind mint outright
+
+# POST /approve: how long a minted grant is valid.
+#
+# This is only ever a floor on staleness. The tool's own
+# max_grant_age_seconds is a CEILING the issuer cannot raise
+# (2026-09-28-approval-grants-design.md §2.3), so a tool that accepts
+# approvals up to five minutes old gets five minutes whatever is set here.
+# Omitted, it is 900.
+approve:
+  ttl_seconds: 900

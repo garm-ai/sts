@@ -53,16 +53,26 @@ fi
 description = "Install the garm CLI at the pinned version"
 # Pinned, not @latest, for the same reason examples pins it: the vocabulary
 # a claims policy is checked against must not shift because someone upgraded
-# a CLI on a laptop. garm is a BINARY here — sts takes no module dependency
-# on garm-ai/garm.
+# a CLI on a laptop. The CLI is a BINARY here, installed rather than
+# imported — and since the split it is all github.com/garm-ai/garm still is.
+# The module dependency approve.go takes is on
+# github.com/garm-ai/contracts/grant, a separate module, which exists so the
+# digest a grant carries and the digest garmd recomputes are one function and
+# not two implementations (approval-grants design, "Decided" item 4). The two
+# versions move independently: bumping this pin cannot change the digest, and
+# bumping the contract cannot change the vocabulary checked below.
 #
-# v0.12.0, not the latest real tag (v0.11.0): `claims check` — what the
-# claims-check task below needs — landed after v0.11.0. v0.12.0 does not
-# exist yet; until a release containing `claims check` is tagged, this
-# install step fails with a module-not-found error naming v0.12.0, which is
-# the honest failure — a release is missing, not "unknown command" as if the
-# wiring below were broken.
-run = "go install github.com/garm-ai/garm/cmd/garm@v0.12.0"
+# v0.14.2: the first tag whose `claims check` and `catalogue build` read the
+# bank example as it is laid out today (agent manifests, material fields).
+# Pinned, not latest, so a garm release cannot turn this repository's CI red
+# on its own; bump it deliberately when the bank example moves.
+# IT MUST MOVE WITH examples, because that tree is what claims-check builds.
+# v0.23.0-rc.1 is the pin examples itself uses: v0.20.0 is the release that
+# reads `catalogue.yaml` at all, and the bank's sixth agent declares
+# MODE_WORKFLOW, whose fields arrive in contracts v0.6.0-rc.1 — the version
+# this CLI links. An older CLI composes the catalogue from a descriptor set
+# that has no such fields, SILENTLY.
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.23.0-rc.1"
 
 [tasks."claims-check"]
 description = "Assert deploy/claims.yaml only references what the bank catalogue declares"
@@ -82,7 +92,16 @@ set -e
 EXAMPLES_DIR="${EXAMPLES_DIR:-../examples}"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-garm catalogue build --proto "$EXAMPLES_DIR/bank/proto" -o "$WORK/bank.binpb" --source garm-ai/examples/bank
+# examples composes its catalogue from a manifest now: the bank's proto tree
+# takes garm/meta/v1/meta.proto and the rest from the contracts MODULE rather
+# than vendoring them, so `--proto` on that directory cannot resolve its own
+# imports. Build from the manifest when the checkout has one, which is also
+# the only way the module versions resolve to that tree's go.mod.
+if [ -f "$EXAMPLES_DIR/catalogue.yaml" ]; then
+  (cd "$EXAMPLES_DIR" && garm catalogue build -o "$WORK/bank.binpb")
+else
+  garm catalogue build --proto "$EXAMPLES_DIR/bank/proto" -o "$WORK/bank.binpb" --source garm-ai/examples/bank
+fi
 garm claims check deploy/claims.yaml --against "$WORK/bank.binpb"
 """
 

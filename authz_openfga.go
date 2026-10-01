@@ -73,6 +73,16 @@ func (a *openFGAAuthorizer) CanInvoke(ctx context.Context, principal, agent stri
 	return a.check(ctx, principal, "can_invoke", agent)
 }
 
+// CanRun checks the store's can_run relation on the agent. Like can_invoke,
+// it is DERIVED in deploy/model.fga — an agent is can_run by any runner
+// written against its runnable_by relation — so this one Check resolves the
+// same real-world fact the file-backed StaticAuthorizer stores as an
+// already-flattened tuple. The indirection is there so a later workload
+// identity can widen runnable_by to a group without every caller changing.
+func (a *openFGAAuthorizer) CanRun(ctx context.Context, runner, agent string) (bool, error) {
+	return a.check(ctx, runner, "can_run", agent)
+}
+
 // HandledBy checks the store's handled_by relation on the customer.
 func (a *openFGAAuthorizer) HandledBy(ctx context.Context, employee, customer string) (bool, error) {
 	return a.check(ctx, employee, "handled_by", customer)

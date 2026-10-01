@@ -109,7 +109,7 @@ func provisionOpenFGAStore(t *testing.T, apiURL string) (storeID, modelID string
 // methods; subject/object are that method's two arguments in order.
 type parityCase struct {
 	name     string
-	method   string // "CanInvoke" | "HandledBy" | "InSegment"
+	method   string // "CanInvoke" | "CanRun" | "HandledBy" | "InSegment"
 	subject  string
 	object   string
 	expected bool
@@ -197,6 +197,33 @@ var parityScenarios = []parityCase{
 		object:   "retail-vip",
 		expected: false,
 	},
+	{
+		// The governed door's own gate. Written flat on the static side and
+		// through runnable_by on the OpenFGA side — the same difference in
+		// modelling that makes this test worth having for can_invoke.
+		name:     "the registered runner may execute the agent",
+		method:   "CanRun",
+		subject:  "runner:agentd",
+		object:   "agent:order-assistant",
+		expected: true,
+	},
+	{
+		name:     "the conformance client may execute the agent",
+		method:   "CanRun",
+		subject:  "runner:conformance-client",
+		object:   "agent:order-assistant",
+		expected: true,
+	},
+	{
+		// An identity entitled to INVOKE the agent is not thereby entitled
+		// to RUN it. Both backends must keep the two relations apart; a
+		// model where can_invoke implied can_run would answer true here.
+		name:     "a customer entitled to invoke the agent may not run it",
+		method:   "CanRun",
+		subject:  "customer:C",
+		object:   "agent:order-assistant",
+		expected: false,
+	},
 }
 
 // ask dispatches one parityCase to whichever of the three Authorizer methods
@@ -208,6 +235,8 @@ func ask(t *testing.T, authz sts.Authorizer, c parityCase) (bool, error) {
 	switch c.method {
 	case "CanInvoke":
 		return authz.CanInvoke(ctx, c.subject, c.object)
+	case "CanRun":
+		return authz.CanRun(ctx, c.subject, c.object)
 	case "HandledBy":
 		return authz.HandledBy(ctx, c.subject, c.object)
 	case "InSegment":

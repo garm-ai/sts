@@ -3,8 +3,11 @@
 #   1. the STS's own ES256 (ECDSA P-256) signing key — loaded into the
 #      environment, never referenced by path in config.yaml (see
 #      deploy/config.yaml's keys.keys[].pem, which names only an env var).
-#   2. a BFF client key pair, for private_key_jwt (RFC 7523) authentication
-#      to POST /token — registered by deploy/config.yaml's clients: block.
+#   2. a client key pair per calling service, for private_key_jwt (RFC 7523)
+#      authentication to POST /token and POST /approve — registered by
+#      deploy/config.yaml's clients: block. The runner's client id is
+#      additionally what makes its "runner:<id>" identity, which
+#      deploy/tuples.yaml's can_run tuple names.
 #
 # Both MUST be on the algorithm allowlist this service actually accepts
 # (issuer.go / clients.go permittedAlgorithms: ES256/384/512, RS256/384/512,
@@ -19,7 +22,12 @@ echo "  export STS_SIGN_KEY_K1=\"\$(cat sts-sign-k1.pem)\""
 echo
 
 mkdir -p clients
-openssl ecparam -name prime256v1 -genkey -noout -out clients/shop-bff.key
-openssl ec -in clients/shop-bff.key -pubout -out clients/shop-bff.pub.pem 2>/dev/null
-echo "Wrote clients/shop-bff.key (the BFF signs its client_assertion with this)"
-echo "Wrote clients/shop-bff.pub.pem (registered in deploy/config.yaml's clients: block)"
+for client in shop-bff agentd; do
+  openssl ecparam -name prime256v1 -genkey -noout -out "clients/$client.key"
+  openssl ec -in "clients/$client.key" -pubout -out "clients/$client.pub.pem" 2>/dev/null
+  echo "Wrote clients/$client.key ($client signs its client_assertion with this)"
+  echo "Wrote clients/$client.pub.pem (registered in deploy/config.yaml's clients: block)"
+done
+echo
+echo "agentd is also the RUNNER identity: deploy/tuples.yaml grants"
+echo "runner:agentd the can_run relation on agent:order-assistant."

@@ -334,3 +334,80 @@ segments:
 		}
 	}
 }
+
+// The approver's authority is RECORDED, not judged (approval-grants §2.4):
+// the STS copies what the approver's own verified token says they hold, and
+// garmd compares it with what the tool requires. So the only thing to get
+// right here is reading it faithfully — including both spellings of a
+// clearance, since garmd accepts both and an IdP may emit either.
+func TestApproverAuthorityFromClaims(t *testing.T) {
+	cases := []struct {
+		name             string
+		raw              map[string]any
+		wantClearance    string
+		wantCompartments []string
+	}{
+		{
+			name: "bare spelling",
+			raw: map[string]any{"garm": map[string]any{
+				"clearance":    "RESTRICTED",
+				"compartments": []any{"financial", "pii-contact"},
+			}},
+			wantClearance:    "RESTRICTED",
+			wantCompartments: []string{"financial", "pii-contact"},
+		},
+		{
+			name: "CLEARANCE_ spelling, which devkit and garmd both emit",
+			raw: map[string]any{"garm": map[string]any{
+				"clearance": "CLEARANCE_INTERNAL",
+			}},
+			wantClearance:    "INTERNAL",
+			wantCompartments: nil,
+		},
+		{
+			name: "compartments sorted, so one approver never mints two different grants",
+			raw: map[string]any{"garm": map[string]any{
+				"clearance":    "PUBLIC",
+				"compartments": []any{"pii-contact", "financial"},
+			}},
+			wantClearance:    "PUBLIC",
+			wantCompartments: []string{"financial", "pii-contact"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := sts.ApproverAuthorityFromClaims(c.raw)
+			if err != nil {
+				t.Fatalf("ApproverAuthorityFromClaims: %v", err)
+			}
+			if got.Clearance != c.wantClearance {
+				t.Errorf("Clearance = %q, want %q", got.Clearance, c.wantClearance)
+			}
+			if !reflect.DeepEqual(got.Compartments, c.wantCompartments) {
+				t.Errorf("Compartments = %v, want %v", got.Compartments, c.wantCompartments)
+			}
+		})
+	}
+}
+
+// An approver whose token asserts no authority is refused at MINT rather
+// than handed a grant garmd will refuse at call time. The grant would carry
+// approver_clearance "" and fail checkShape's approver_min_clearance test
+// with a message about the approver being under-cleared, which sends an
+// operator looking at the wrong system entirely.
+func TestApproverAuthorityFromClaimsRefusesAnEmptyOrUnknownClearance(t *testing.T) {
+	cases := map[string]map[string]any{
+		"no garm claim at all":  {"sub": "jdoe"},
+		"garm is not an object": {"garm": "RESTRICTED"},
+		"empty clearance":       {"garm": map[string]any{"clearance": ""}},
+		"absent clearance":      {"garm": map[string]any{"compartments": []any{"financial"}}},
+		"unknown clearance":     {"garm": map[string]any{"clearance": "TOP_SECRET"}},
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := sts.ApproverAuthorityFromClaims(raw); err == nil {
+				t.Fatal("got nil error; an approver asserting no usable authority must be refused here")
+			}
+		})
+	}
+}

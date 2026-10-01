@@ -31,3 +31,15 @@
 - user: employee:jdoe
   relation: handled_by
   object: customer:C
+
+# The same two can_run facts. Unlike can_invoke these are written directly
+# against runnable_by rather than derived through a segment: a runner is not
+# a member of anything, it is named. deploy/model.fga still routes the check
+# through can_run: runnable_by, so a later group-based runnable_by needs no
+# change on this side.
+- user: runner:agentd
+  relation: runnable_by
+  object: agent:order-assistant
+- user: runner:conformance-client
+  relation: runnable_by
+  object: agent:order-assistant

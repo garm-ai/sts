@@ -8,7 +8,7 @@
 # segment membership does not by itself grant that customer's employees
 # `handled_by`; write `handled_by` directly).
 #
-# Exactly three relations, named after Authorizer's three methods. Absence
+# Exactly four relations, named after Authorizer's four methods. Absence
 # of a tuple here is a denial, never an error: an unlisted principal, agent,
 # employee, customer or segment simply answers false.
 #
@@ -50,3 +50,17 @@ in_segment:
   # exercised by anything.
   - principal: employee:jdoe
     segment: support-staff
+
+# CanRun(runner, agent): may this RUNNER execute this agent? Asked by the
+# governed door (program plan §3.9) before can_invoke, and asked of the
+# client id the runner AUTHENTICATED as — "runner:" + that id — never of a
+# field the caller supplies. Two entries, because two processes legitimately
+# run this agent in this repository's own setups: agentd is the real runner
+# (deploy/config.yaml registers it as a client), and conformance-client is
+# the id garmd's identity-conformance job authenticates with, so its
+# exchange-2 case has a tuple to match.
+can_run:
+  - runner: runner:agentd
+    agent: agent:order-assistant
+  - runner: runner:conformance-client
+    agent: agent:order-assistant

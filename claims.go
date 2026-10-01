@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -313,6 +314,77 @@ func dedupeSorted(vals []string) []string {
 	set := make(map[string]struct{}, len(vals))
 	for _, v := range vals {
 		set[v] = struct{}{}
+	}
+	return sortedKeys(set)
+}
+
+// ApproverAuthority is what an approver's own verified token says they
+// hold.
+//
+// It is READ from the token rather than resolved from this policy, and that
+// is the one place the approval path differs from the delegation path.
+// Approval-grants §2.4: the STS RECORDS the approver's authority and does
+// not judge it — garmd compares it against what the tool declares, because
+// the catalogue is the thing that knows what a tool requires. Resolving it
+// here from segments would make this service decide who may approve, which
+// is precisely the decision it is designed not to hold.
+type ApproverAuthority struct {
+	// Clearance is the BARE spelling ("RESTRICTED"), whichever form the
+	// token used.
+	Clearance string
+
+	// Compartments are sorted and deduplicated. Map and slice order must
+	// never leak into a signed credential, or one approver's identical
+	// decision mints two different grants.
+	Compartments []string
+}
+
+// ApproverAuthorityFromClaims reads the `garm` claim off an ALREADY
+// VERIFIED upstream token.
+//
+// An absent, empty or unrecognised clearance is a refusal. A grant
+// recording no authority is one garmd refuses on approver_min_clearance
+// anyway, with a message about the approver being under-cleared — which is
+// true and useless, because the actual fault is an IdP that minted a token
+// with no garm claim. Refusing here names the right system.
+func ApproverAuthorityFromClaims(raw map[string]any) (*ApproverAuthority, error) {
+	g, ok := raw["garm"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("claims: the approver's token carries no garm claim")
+	}
+	clearance, _ := g["clearance"].(string)
+	if clearance == "" {
+		return nil, fmt.Errorf("claims: the approver's garm claim has no clearance")
+	}
+	bare := normaliseClearanceName(clearance)
+	if _, known := clearanceOrder[bare]; !known {
+		return nil, fmt.Errorf("claims: the approver's garm claim has clearance %q, want one of PUBLIC, INTERNAL, CONFIDENTIAL, RESTRICTED", clearance)
+	}
+	return &ApproverAuthority{Clearance: bare, Compartments: stringsFromAny(g["compartments"])}, nil
+}
+
+// normaliseClearanceName accepts both spellings garmd accepts —
+// "RESTRICTED" and "CLEARANCE_RESTRICTED" — and returns the bare one
+// clearanceOrder is keyed by. devkit emits the prefixed form and a human
+// writes the bare one, so both arrive in practice.
+func normaliseClearanceName(s string) string {
+	return strings.TrimPrefix(s, "CLEARANCE_")
+}
+
+// stringsFromAny reads a JSON string array out of a decoded claim map,
+// dropping anything that is not a non-empty string rather than failing: a
+// compartment list with one odd element must cost that compartment, not the
+// whole approval. The result is sorted for the reason unionOf's output is.
+func stringsFromAny(v any) []string {
+	items, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	set := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		if s, ok := it.(string); ok && s != "" {
+			set[s] = struct{}{}
+		}
 	}
 	return sortedKeys(set)
 }

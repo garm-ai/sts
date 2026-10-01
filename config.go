@@ -46,6 +46,12 @@ type Config struct {
 	// "use NewServer's default" (10 minutes).
 	DelegationTTL time.Duration
 
+	// ApproveTTL bounds how long a minted GRANT is valid. Zero means "use
+	// NewServer's default" (15 minutes) — the default lives in exactly one
+	// place, so a config that omits the key and a Server built directly in
+	// Go cannot disagree about it.
+	ApproveTTL time.Duration
+
 	// Keys are every configured signing key, PEM already resolved from its
 	// named environment variable (see resolveSecretPEM). ActiveKey names
 	// which one signs new tokens; the rest stay served for verification
@@ -122,6 +128,13 @@ type configFile struct {
 		Status            string `yaml:"status"`
 		UnconfinedCeiling string `yaml:"unconfinedCeiling"`
 	} `yaml:"instanceAuthorization"`
+
+	// Snake_case where its neighbours are camelCase, because the
+	// cross-repository interface contract (program plan §3.10) names it
+	// that way. Renaming it is renaming an operator's key.
+	Approve struct {
+		TTLSeconds int `yaml:"ttl_seconds"`
+	} `yaml:"approve"`
 }
 
 // keyConfigFile is one signing key. PEM is NEVER the key material itself —
@@ -391,6 +404,15 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.InstanceAuthorization.UnconfinedCeiling = ceiling
 	}
 
+	// --- approve (approval-grants design §2.3) ---------------------------
+
+	if secs := cf.Approve.TTLSeconds; secs != 0 {
+		if secs < 0 {
+			return nil, fmt.Errorf("sts: config: approve.ttl_seconds is %d; it must be positive — a grant that expires before it is minted is refused by every verifier that sees it", secs)
+		}
+		cfg.ApproveTTL = time.Duration(secs) * time.Second
+	}
+
 	return cfg, nil
 }
 
@@ -437,6 +459,7 @@ func (c *Config) Build(ctx context.Context, authz Authorizer) (*Server, error) {
 		Clients:       clients,
 		DelegationTTL: c.DelegationTTL,
 		InstanceAuthz: c.InstanceAuthorization,
+		ApproveTTL:    c.ApproveTTL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sts: config: %w", err)
