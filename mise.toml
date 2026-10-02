@@ -67,12 +67,19 @@ description = "Install the garm CLI at the pinned version"
 # Pinned, not latest, so a garm release cannot turn this repository's CI red
 # on its own; bump it deliberately when the bank example moves.
 # IT MUST MOVE WITH examples, because that tree is what claims-check builds.
-# v0.23.0-rc.1 is the pin examples itself uses: v0.20.0 is the release that
+# v0.23.0-rc.1 was the pin examples itself used: v0.20.0 is the release that
 # reads `catalogue.yaml` at all, and the bank's sixth agent declares
 # MODE_WORKFLOW, whose fields arrive in contracts v0.6.0-rc.1 — the version
 # this CLI links. An older CLI composes the catalogue from a descriptor set
 # that has no such fields, SILENTLY.
-run = "go install github.com/garm-ai/garm/cmd/garm@v0.23.0-rc.1"
+#
+# Raised again, from the release candidate to v0.29.0, because "it must move
+# with examples" was true and had stopped being honoured: examples moved on
+# to v0.29.0 (which deletes --proto) while this pin sat six minor releases
+# behind, on a CLI that predates lint rules A12-A15 — a consent template the
+# bank gains later would lint clean here and nowhere else, which is a rule
+# skipped where nobody is looking.
+run = "go install github.com/garm-ai/garm/cmd/garm@v0.29.0"
 
 [tasks."claims-check"]
 description = "Assert deploy/claims.yaml only references what the bank catalogue declares"
