@@ -1740,3 +1740,99 @@ func TestExchange2HumanDelegationStillCarriesTheAgentActChain(t *testing.T) {
 		t.Errorf("act.garm.tool_sets = %v, want [support] — the agent's own declared scope, unchanged by this fix", strSlice(actGarm, "tool_sets"))
 	}
 }
+
+// --- the agent attribution claim (contracts v0.12.0, InvocationContext.agent,
+// field 12) ------------------------------------------------------------------
+//
+// The act-chain fix above correctly stopped a SERVICE self-mint's agent from
+// folding authority, but it also stopped attributing the run to that agent at
+// all — garmd's Agent: p.Actor (core.go:1023) is sourced from the delegation
+// chain, which the fix emptied for exactly this case. contracts v0.12.0 gave
+// attribution a home that is NOT the chain: InvocationContext.agent, field
+// 12, whose own doc states the rule this section exists to satisfy: "`act`
+// answers 'whose authority is this'; this answers 'whose run was it'."
+//
+// These three tests mint carries that claim, that it is absent where there is
+// genuinely nothing to attribute, and — the one that matters — that its mere
+// presence changes nothing Fold narrows.
+
+// TestExchange2ServiceSelfMintCarriesAnAgentAttributionClaim is the positive
+// case: the agent named for CanRun now also reaches the token, as a
+// standalone claim, so garmd has something to forward.
+func TestExchange2ServiceSelfMintCarriesAnAgentAttributionClaim(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowRun("runner:agentd", "agent:support-assistant")
+	f := newFixture(t, selfMintPolicy, authz, enforced)
+
+	claims := f.mint(f.form2As("agentd", "service:agentd", "SERVICE", "support-assistant", "acme"))
+
+	if got := str(claims, "agent"); got != "agent:support-assistant" {
+		t.Errorf(`agent = %q, want "agent:support-assistant" — type-prefixed, the same shape every other identity on this token uses`, got)
+	}
+	// Still no act — this claim is how attribution travels NOW that act no
+	// longer carries it, not a second place agent-as-actor could sneak back
+	// in.
+	if _, present := claims["act"]; present {
+		t.Error("act present; the agent attribution claim exists precisely so act does not have to carry the agent")
+	}
+}
+
+// TestExchangeWithNoAgentNamedCarriesNoAgentAttributionClaim is the "exec"
+// precedent applied here too: a mint that genuinely has no agent to
+// attribute — an employee exercising a handled-by customer's authority
+// directly, no agent in the call at all — carries no `agent` claim, honestly,
+// rather than an empty value nothing attested.
+func TestExchangeWithNoAgentNamedCarriesNoAgentAttributionClaim(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("customer:C-1", "retail-vip")
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowHandledBy("employee:jdoe", "customer:C-1")
+	f := newFixture(t, exchangePolicy, authz, enforced)
+
+	claims := f.mint(f.form(f.employeeToken("jdoe", nil), "customer:C-1", ""))
+
+	if _, present := claims["agent"]; present {
+		t.Errorf(`agent = %#v present; no agent was named at all, so there is nothing to attribute`, claims["agent"])
+	}
+}
+
+// TestExchange2ServiceSelfMintAgentAttributionClaimDoesNotTouchToolSets is
+// the regression guard F21 earned: the whole reason the agent left `act` was
+// that Fold intersects tool_sets unconditionally at every chain level, and
+// this claim exists to carry the SAME piece of information (which agent)
+// back onto the token. If it ever ended up anywhere Fold's chain walk
+// reaches — inside `garm`, inside `act`, or as a second `act`-like level —
+// this would be F21 again, in a new field.
+//
+// What structurally prevents that: `agent` is a sibling of `exec` and
+// `tenant` on mintedToken, read once, outside the `Garm`/`Act` recursion.
+// Fold's chain walk (`for cur := c; cur != nil; cur = cur.Act`) only ever
+// dereferences `cur.Garm` and advances via `cur.Act` — it has no reference to
+// this field, or to `Exec`, at all. That is a fact about Fold's loop body,
+// not a convention this claim merely happens to respect, which is why this
+// test asserts the OUTCOME (tool_sets unaffected) rather than the field's
+// mere existence: a claim that sat in the right place but somehow still got
+// folded would still be the bug.
+func TestExchange2ServiceSelfMintAgentAttributionClaimDoesNotTouchToolSets(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowRun("runner:agentd", "agent:support-assistant")
+	f := newFixture(t, selfMintPolicy, authz, enforced)
+
+	claims := f.mint(f.form2As("agentd", "service:agentd", "SERVICE", "support-assistant", "acme"))
+
+	if got := str(claims, "agent"); got != "agent:support-assistant" {
+		t.Fatalf(`agent = %q, want "agent:support-assistant"`, got)
+	}
+	garm, ok := claims["garm"].(map[string]any)
+	if !ok {
+		t.Fatal("no garm claim on the sub level")
+	}
+	// support-assistant declares tool_sets: [support] — disjoint from
+	// agentd's [escalation]. Before F21 this intersected to empty; the agent
+	// attribution claim re-adds the agent's NAME to the token, and if that
+	// name carried its claim along with it the way `act` used to, this would
+	// be empty again.
+	if !sliceEqual(strSlice(garm, "tool_sets"), []string{"escalation"}) {
+		t.Errorf("garm.tool_sets = %v, want [escalation] unchanged — the agent attribution claim must narrow nothing", strSlice(garm, "tool_sets"))
+	}
+}

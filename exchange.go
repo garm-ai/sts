@@ -280,6 +280,30 @@ type mintedToken struct {
 	// runner" must be answerable from the token's shape, and an always-
 	// present key whose contents happen to be blank does not answer it.
 	Exec *execClaimJSON `json:"exec,omitempty"`
+
+	// Agent is attribution, never authority: contracts v0.12.0's
+	// InvocationContext.agent (field 12), whose own doc states the rule —
+	// "`act` answers 'whose authority is this'; this answers 'whose run was
+	// it'." Type-prefixed ("agent:<name>"), the same shape every other
+	// identity on this token uses, and set whenever `in.agent` names one,
+	// whether this is a SERVICE self-mint (where it is ALL that now says
+	// which agent the run was for — see actClaimJSON's doc) or a genuine
+	// delegation (where `act` already says so too; this is simply the one
+	// place every mint naming an agent agrees to say it, so a consumer needs
+	// no second code path for the self-mint case). `omitempty` so a mint that
+	// names no agent at all carries no key, honestly, the same convention
+	// Exec follows.
+	//
+	// STRUCTURALLY NOT FOLDED, and that is the whole point of this field
+	// existing rather than reusing `act`: it is a sibling of Exec and Tenant
+	// here, read once, entirely outside the Garm/Act recursion. A consumer's
+	// Fold walks a chain with `for cur := c; cur != nil; cur = cur.Act`,
+	// dereferencing only `cur.Garm` at each step — it has no reference to
+	// this field, or to Exec, at all. That is a fact about the shape of that
+	// loop, not a convention this field merely happens to respect, and it is
+	// why a claim carrying the same information `act` used to is safe to
+	// reintroduce: there is no path from here into anything Fold intersects.
+	Agent string `json:"agent,omitempty"`
 }
 
 // tokenResponse is the RFC 8693 §2.2.1 success response.
@@ -1057,6 +1081,15 @@ func (s *Server) resolveAndMint(ctx context.Context, in mintInputs) (string, tim
 		}
 	}
 
+	// agentClaim is "" (so the omitempty field stays absent) unless an agent
+	// was actually named — mirrors mintingForAgent, not selfMint, because a
+	// genuine delegation attributes the run to its agent exactly as much as
+	// a self-mint does; only the chain, not this claim, tells the two apart.
+	var agentClaim string
+	if mintingForAgent {
+		agentClaim = "agent:" + in.agent
+	}
+
 	claims := mintedToken{
 		Issuer:    s.issuer,
 		Audience:  s.audience,
@@ -1068,6 +1101,7 @@ func (s *Server) resolveAndMint(ctx context.Context, in mintInputs) (string, tim
 		Garm:      toGarmClaimJSON(subClaim),
 		Act:       act,
 		Exec:      in.exec,
+		Agent:     agentClaim,
 	}
 
 	tok, err := s.keyring.Sign(claims)
