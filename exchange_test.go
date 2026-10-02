@@ -1457,20 +1457,31 @@ func TestExchange2AsksCanRunBeforeCanInvokeAndNeverProbesOnADeniedRun(t *testing
 
 // --- the service principal ------------------------------------------------
 
-// The mint tasksd's Create needs: Kind PRINCIPAL_KIND_SERVICE *and*
-// HasAgent(). Both halves come from this one exchange — devkit refuses an
-// `act` chain at mint time on a service token (a service calls as itself and
-// the chain is added per call), so if this door did not add it, nothing
-// would, and `create_task` would be unreachable to every caller in the
-// platform.
-func TestExchange2MintsAServicePrincipalCarryingAnAgentChain(t *testing.T) {
+// TestExchange2ServiceSelfMintCarriesNoActChain is the rewrite of what this
+// test asserted before the f21 fix (f21-act-chain-fix-report.md): that a
+// SERVICE self-mint's `act` level carried the named agent's own claim. That
+// was the bug — folding the agent in is exactly what let garmd's Fold
+// intersect the service's `tool_sets` away to nothing (stack-repair-report.md
+// §4.2) — so the renamed test now asserts the opposite: no `act` entry at
+// all, and the service's OWN declared `tool_sets` surviving untouched.
+//
+// It uses selfMintPolicy rather than exchangePolicy specifically because
+// exchangePolicy's agentd/write-bot pair declares no tool_sets on either
+// side, which is why the original version of this test, passing throughout,
+// never once observed the defect it was named for: intersectSets' "nil add
+// is no constraint" branch made the fold a no-op regardless of whether the
+// agent ever reached `act`. selfMintPolicy's agentd is scoped to
+// [escalation] and support-assistant to a disjoint [support] — the shape
+// that actually broke in production — so this test would have failed
+// against the pre-f21 code.
+func TestExchange2ServiceSelfMintCarriesNoActChain(t *testing.T) {
 	authz := newFakeAuthz()
 	// can_run only. No can_invoke tuple is written for the service, and the
 	// absence is deliberate — see the assertion on the call log below.
-	authz.allowRun("runner:agentd", "agent:write-bot")
-	f := newFixture(t, exchangePolicy, authz, enforced)
+	authz.allowRun("runner:agentd", "agent:support-assistant")
+	f := newFixture(t, selfMintPolicy, authz, enforced)
 
-	claims := f.mint(f.form2As("agentd", "service:agentd", "SERVICE", "write-bot", "acme"))
+	claims := f.mint(f.form2As("agentd", "service:agentd", "SERVICE", "support-assistant", "acme"))
 
 	if got := str(claims, "sub"); got != "service:agentd" {
 		t.Errorf("sub = %q, want service:agentd — the service calls on its own behalf", got)
@@ -1491,33 +1502,24 @@ func TestExchange2MintsAServicePrincipalCarryingAnAgentChain(t *testing.T) {
 	if got := str(garm, "clearance"); got != "PUBLIC" {
 		t.Errorf("garm.clearance = %q, want the declared PUBLIC", got)
 	}
-	if !sliceEqual(strSlice(garm, "verbs"), []string{"WRITE"}) {
-		t.Errorf("garm.verbs = %v, want [WRITE] as declared", strSlice(garm, "verbs"))
+	if !sliceEqual(strSlice(garm, "verbs"), []string{"READ", "WRITE"}) {
+		t.Errorf("garm.verbs = %v, want [READ, WRITE] as declared", strSlice(garm, "verbs"))
 	}
-	// Unscoped: create_task declares no tool set, and garmd refuses a SCOPED
-	// caller any tool in no set. An empty list here would read as "no set at
-	// all" and close the path this mint exists to open.
-	if _, present := garm["tool_sets"]; present {
-		t.Errorf("garm.tool_sets is present (%#v); a service that names none must be unscoped, and only an absent claim says that", garm["tool_sets"])
+	// SCOPED to exactly what agentd declares — [escalation] — and untouched
+	// by anything about the named agent. Before f21 this came back EMPTY,
+	// non-nil, because Fold intersected it against support-assistant's
+	// [support]: this is the one assertion that would have caught the bug
+	// directly, had the original fixture given it anything to intersect.
+	if !sliceEqual(strSlice(garm, "tool_sets"), []string{"escalation"}) {
+		t.Errorf("garm.tool_sets = %v, want [escalation] — the service's own declared scope, which a consumer's Fold must receive unintersected", strSlice(garm, "tool_sets"))
 	}
 
-	// The act chain — the HasAgent() half of tasksd's gate.
-	act, ok := claims["act"].(map[string]any)
-	if !ok {
-		t.Fatal("no act level; tasksd's Create requires Kind SERVICE *and* HasAgent(), and devkit will not add the chain at mint time")
-	}
-	if got := str(act, "sub"); got != "agent:write-bot" {
-		t.Errorf("act.sub = %q, want agent:write-bot — the agent the caller named", got)
-	}
-	actGarm, ok := act["garm"].(map[string]any)
-	if !ok {
-		t.Fatal("the act level carries no garm claim; garmd's ParseClaims refuses the whole token")
-	}
-	if got := str(actGarm, "kind"); got != "AGENT" {
-		t.Errorf("act.garm.kind = %q, want AGENT", got)
-	}
-	if _, nested := act["act"]; nested {
-		t.Error("act carries a nested act; a service mint is depth two — the service at sub, the agent at act")
+	// THE FIX: no act level at all. The agent named here was authorization
+	// input to CanRun (below) and never an actor — there is nothing for a
+	// consumer's Fold to narrow this service's claim against.
+	if act, present := claims["act"]; present {
+		t.Errorf("act = %#v present; a service self-mint names the agent as authorization input to CanRun, "+
+			"never as an actor, so there must be no `act` entry for anything to fold against", act)
 	}
 
 	// Provenance is still the runner, and still exec rather than an act link.
@@ -1544,6 +1546,9 @@ func TestExchange2MintsAServicePrincipalCarryingAnAgentChain(t *testing.T) {
 			t.Errorf("asked %s; a service is not segment-matched — it is one identity with one declared authority", c)
 		}
 	}
+	// can_run is still the one relationship standing between a runner and a
+	// service mint — see f21-act-chain-fix-report.md's §1: removing the
+	// agent from `act` must never have cost this check.
 	if firstCallTo(authz.recorded(), "CanRun") < 0 {
 		t.Error("never asked CanRun; it is the only relationship standing between a runner and a service mint")
 	}
@@ -1605,18 +1610,41 @@ func TestExchange2RefusesAServiceSubjectItCannotJustify(t *testing.T) {
 	}
 }
 
-// A service's own clearance and verbs are the ceiling, and the agent's are
-// the other half of the fold — so a service with WRITE acting as an agent
-// with only READ mints nothing. Minting it would hand garmd a token whose
-// chain intersects to no verb at all, which it refuses, and the operator
-// reads that as a garmd fault rather than a policy that never agreed.
-func TestExchange2RefusesAServiceWhoseVerbsMissTheAgentsEntirely(t *testing.T) {
+// TestExchange2ServiceSelfMintSucceedsDespiteDisjointAgentVerbsAndToolSets is
+// the rewrite of what this test asserted before the f21 fix: that a service
+// whose verbs shared nothing with the named agent's minted nothing, on the
+// theory that the agent's claim was the other half of a fold this exchange
+// was computing. It was not — the agent is authorization input to CanRun,
+// never a party this mint's chain includes — so there is nothing left to
+// intersect and nothing left to refuse on that basis: this now asserts the
+// mint SUCCEEDS, carries no `act`, and the service's own verbs and tool_sets
+// are exactly what it declared, regardless of what the agent happens to
+// hold.
+//
+// destructive-bot is deliberately the sharpest case selfMintPolicy has: its
+// verb (DESTRUCTIVE) and its set (danger) share NOTHING with agentd's
+// declared [READ, WRITE] / [escalation] — not one axis in common — so this
+// is not a near miss, and it would have failed outright, on the old
+// assertion, against the pre-f21 code.
+func TestExchange2ServiceSelfMintSucceedsDespiteDisjointAgentVerbsAndToolSets(t *testing.T) {
 	authz := newFakeAuthz()
-	authz.allowRun("runner:agentd", "agent:order-assistant") // READ only
-	f := newFixture(t, exchangePolicy, authz, enforced)
+	authz.allowRun("runner:agentd", "agent:destructive-bot")
+	f := newFixture(t, selfMintPolicy, authz, enforced)
 
-	if resp := f.do(f.form2As("agentd", "service:agentd", "SERVICE", "order-assistant", "acme")); resp.StatusCode == http.StatusOK {
-		t.Fatal("minted a service token whose verb intersection with the agent is empty")
+	claims := f.mint(f.form2As("agentd", "service:agentd", "SERVICE", "destructive-bot", "acme"))
+
+	if _, present := claims["act"]; present {
+		t.Error("act present; the named agent's own verbs/tool_sets must not matter to a service self-mint")
+	}
+	garm, ok := claims["garm"].(map[string]any)
+	if !ok {
+		t.Fatal("no garm claim on the sub level")
+	}
+	if !sliceEqual(strSlice(garm, "verbs"), []string{"READ", "WRITE"}) {
+		t.Errorf("garm.verbs = %v, want [READ, WRITE] as agentd declared, untouched by destructive-bot's [DESTRUCTIVE]", strSlice(garm, "verbs"))
+	}
+	if !sliceEqual(strSlice(garm, "tool_sets"), []string{"escalation"}) {
+		t.Errorf("garm.tool_sets = %v, want [escalation] as agentd declared, untouched by destructive-bot's [danger]", strSlice(garm, "tool_sets"))
 	}
 }
 
@@ -1639,59 +1667,28 @@ func TestExchange2RefusesAServiceWhoseVerbsMissTheAgentsEntirely(t *testing.T) {
 // declares any tool_sets at all — intersectSets' "nil add is no constraint"
 // branch makes the bug invisible to every existing test in this file, which
 // is exactly how it reached production.
+//
+// destructive-bot exists for the same reason, one dimension over: its verb
+// (DESTRUCTIVE) and its set (danger) share NOTHING with agentd's declared
+// [READ, WRITE] / [escalation] — neither a verb nor a set in common — so a
+// test that names it is the sharpest possible demonstration that a service
+// self-mint's own authority stands alone, un-intersected against the
+// agent's, on every axis Fold narrows.
 const selfMintPolicy = `
 roles:
-  support-desk: { clearance: INTERNAL, compartments: [], verbs: [READ], tool_sets: [support] }
+  support-desk:     { clearance: INTERNAL, compartments: [], verbs: [READ],       tool_sets: [support] }
+  destructive-only: { clearance: INTERNAL, compartments: [], verbs: [DESTRUCTIVE], tool_sets: [danger] }
 
 segments:
   support-staff: { kind: employee, roles: [support-desk] }
 
 agents:
   support-assistant: { roles: [support-desk] }
+  destructive-bot:   { roles: [destructive-only] }
 
 services:
   agentd: { clearance: PUBLIC, verbs: [READ, WRITE], tool_sets: [escalation] }
 `
-
-// TestExchange2ServiceSelfMintCarriesNoActChain is the fix itself: the agent
-// named in a SERVICE self-mint (on_behalf_of == "service:"+clientID) is
-// authorization input to CanRun, never an actor, so the minted token carries
-// no `act` entry at all — nothing for a consumer's Fold to intersect tool_sets
-// against beyond the service's own declared claim.
-func TestExchange2ServiceSelfMintCarriesNoActChain(t *testing.T) {
-	authz := newFakeAuthz()
-	authz.allowRun("runner:agentd", "agent:support-assistant")
-	f := newFixture(t, selfMintPolicy, authz, enforced)
-
-	claims := f.mint(f.form2As("agentd", "service:agentd", "SERVICE", "support-assistant", "acme"))
-
-	if got := str(claims, "sub"); got != "service:agentd" {
-		t.Errorf("sub = %q, want service:agentd", got)
-	}
-	garm, ok := claims["garm"].(map[string]any)
-	if !ok {
-		t.Fatal("no garm claim on the sub level")
-	}
-	if !sliceEqual(strSlice(garm, "tool_sets"), []string{"escalation"}) {
-		t.Errorf("garm.tool_sets = %v, want [escalation] — the service's own declared scope, untouched by anything this test does", strSlice(garm, "tool_sets"))
-	}
-
-	if act, present := claims["act"]; present {
-		t.Fatalf("act = %#v present; a service self-mint names the agent as authorization input to CanRun, "+
-			"never as an actor, and an `act` entry here is exactly what a consumer's Fold intersects "+
-			"tool_sets against — the bug this fix removes", act)
-	}
-
-	// Attribution survives at exec, same as every other governed mint — this
-	// fix removes the agent from `act`, not the runner from `exec`.
-	exec, ok := claims["exec"].(map[string]any)
-	if !ok {
-		t.Fatal("no exec claim; the governed door still records which runner obtained the token")
-	}
-	if got := str(exec, "sub"); got != "runner:agentd" {
-		t.Errorf("exec.sub = %q, want runner:agentd", got)
-	}
-}
 
 // TestExchange2ServiceSelfMintStillRequiresCanRun pins the check that must
 // not regress alongside the act-chain fix: the agent no longer appears in
