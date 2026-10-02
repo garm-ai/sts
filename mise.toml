@@ -92,16 +92,13 @@ set -e
 EXAMPLES_DIR="${EXAMPLES_DIR:-../examples}"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-# examples composes its catalogue from a manifest now: the bank's proto tree
+# examples composes its catalogue from catalogue.yaml: the bank's proto tree
 # takes garm/meta/v1/meta.proto and the rest from the contracts MODULE rather
-# than vendoring them, so `--proto` on that directory cannot resolve its own
-# imports. Build from the manifest when the checkout has one, which is also
-# the only way the module versions resolve to that tree's go.mod.
-if [ -f "$EXAMPLES_DIR/catalogue.yaml" ]; then
-  (cd "$EXAMPLES_DIR" && garm catalogue build -o "$WORK/bank.binpb")
-else
-  garm catalogue build --proto "$EXAMPLES_DIR/bank/proto" -o "$WORK/bank.binpb" --source garm-ai/examples/bank
-fi
+# than vendoring them, so a single directory cannot resolve its own imports —
+# `--proto` could not build this tree even before garm deleted it. Building
+# via the manifest is also the only way the module versions resolve to that
+# tree's go.mod.
+(cd "$EXAMPLES_DIR" && garm catalogue build -o "$WORK/bank.binpb")
 garm claims check deploy/claims.yaml --against "$WORK/bank.binpb"
 """
 
