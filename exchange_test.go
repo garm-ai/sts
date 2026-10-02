@@ -1619,3 +1619,127 @@ func TestExchange2RefusesAServiceWhoseVerbsMissTheAgentsEntirely(t *testing.T) {
 		t.Fatal("minted a service token whose verb intersection with the agent is empty")
 	}
 }
+
+// --- the self-mint act-chain fix (f21) --------------------------------------
+//
+// stack-repair-report.md §4.2: ExchangeService is Exchange2 with on_behalf_of
+// == "service:"+clientID, so the agent it names used to land at `act` — an
+// actor in the delegation chain — and garmd's Fold intersects tool_sets
+// UNCONDITIONALLY at every chain level, before the first-level shortcut
+// clearance/compartments/verbs get. A service scoped to tool_sets:
+// [escalation] folded against ANY agent (none of which declare escalation,
+// nor should they — that is the set's entire purpose) always intersected to
+// the empty, non-nil scope, and garmd's inScope treats a non-nil empty scope
+// as reaching nothing. create_task was one of the zero tools reachable.
+//
+// selfMintPolicy mirrors examples/bank/auth/claims.yaml closely enough to
+// reproduce that exactly: agentd is scoped to [escalation] and
+// support-assistant is scoped to a disjoint set, [support]. exchangePolicy's
+// write-bot and order-assistant never exercise this, because neither one
+// declares any tool_sets at all — intersectSets' "nil add is no constraint"
+// branch makes the bug invisible to every existing test in this file, which
+// is exactly how it reached production.
+const selfMintPolicy = `
+roles:
+  support-desk: { clearance: INTERNAL, compartments: [], verbs: [READ], tool_sets: [support] }
+
+segments:
+  support-staff: { kind: employee, roles: [support-desk] }
+
+agents:
+  support-assistant: { roles: [support-desk] }
+
+services:
+  agentd: { clearance: PUBLIC, verbs: [READ, WRITE], tool_sets: [escalation] }
+`
+
+// TestExchange2ServiceSelfMintCarriesNoActChain is the fix itself: the agent
+// named in a SERVICE self-mint (on_behalf_of == "service:"+clientID) is
+// authorization input to CanRun, never an actor, so the minted token carries
+// no `act` entry at all — nothing for a consumer's Fold to intersect tool_sets
+// against beyond the service's own declared claim.
+func TestExchange2ServiceSelfMintCarriesNoActChain(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowRun("runner:agentd", "agent:support-assistant")
+	f := newFixture(t, selfMintPolicy, authz, enforced)
+
+	claims := f.mint(f.form2As("agentd", "service:agentd", "SERVICE", "support-assistant", "acme"))
+
+	if got := str(claims, "sub"); got != "service:agentd" {
+		t.Errorf("sub = %q, want service:agentd", got)
+	}
+	garm, ok := claims["garm"].(map[string]any)
+	if !ok {
+		t.Fatal("no garm claim on the sub level")
+	}
+	if !sliceEqual(strSlice(garm, "tool_sets"), []string{"escalation"}) {
+		t.Errorf("garm.tool_sets = %v, want [escalation] — the service's own declared scope, untouched by anything this test does", strSlice(garm, "tool_sets"))
+	}
+
+	if act, present := claims["act"]; present {
+		t.Fatalf("act = %#v present; a service self-mint names the agent as authorization input to CanRun, "+
+			"never as an actor, and an `act` entry here is exactly what a consumer's Fold intersects "+
+			"tool_sets against — the bug this fix removes", act)
+	}
+
+	// Attribution survives at exec, same as every other governed mint — this
+	// fix removes the agent from `act`, not the runner from `exec`.
+	exec, ok := claims["exec"].(map[string]any)
+	if !ok {
+		t.Fatal("no exec claim; the governed door still records which runner obtained the token")
+	}
+	if got := str(exec, "sub"); got != "runner:agentd" {
+		t.Errorf("exec.sub = %q, want runner:agentd", got)
+	}
+}
+
+// TestExchange2ServiceSelfMintStillRequiresCanRun pins the check that must
+// not regress alongside the act-chain fix: the agent no longer appears in
+// the minted token, but it is still asked of CanRun before anything mints. A
+// fix that stopped asking would trade this bug for a worse one — a service
+// minting for ANY agent at all, approved or not.
+func TestExchange2ServiceSelfMintStillRequiresCanRun(t *testing.T) {
+	authz := newFakeAuthz() // no can_run tuple written at all
+	f := newFixture(t, selfMintPolicy, authz, enforced)
+
+	resp := f.do(f.form2As("agentd", "service:agentd", "SERVICE", "support-assistant", "acme"))
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400 (denied); minted without a can_run tuple at all: %s", resp.StatusCode, body)
+	}
+	if i := firstCallTo(authz.recorded(), "CanRun"); i < 0 {
+		t.Fatalf("CanRun was never asked; calls: %v", authz.recorded())
+	}
+}
+
+// TestExchange2HumanDelegationStillCarriesTheAgentActChain is the regression
+// this fix must not cause: a REAL on-behalf-of exchange — a human subject,
+// an agent acting for them — is untouched. Its act chain still names the
+// agent and still carries the agent's own declared claim, tool_sets
+// included: unlike the service's self-mint, this agent genuinely IS the
+// actor, and a consumer's Fold narrowing against it is the whole point of
+// delegation (spec §2.3) — not the bug fixed above.
+func TestExchange2HumanDelegationStillCarriesTheAgentActChain(t *testing.T) {
+	authz := newFakeAuthz()
+	authz.allowSegment("employee:jdoe", "support-staff")
+	authz.allowInvoke("employee:jdoe", "agent:support-assistant")
+	authz.allowRun("runner:shop-bff", "agent:support-assistant")
+	f := newFixture(t, selfMintPolicy, authz, enforced)
+
+	claims := f.mint(f.form2("employee:jdoe", "USER", "support-assistant", "acme"))
+
+	act, ok := claims["act"].(map[string]any)
+	if !ok {
+		t.Fatal("no act level; a genuine on-behalf-of exchange must still carry one")
+	}
+	if got := str(act, "sub"); got != "agent:support-assistant" {
+		t.Errorf("act.sub = %q, want agent:support-assistant", got)
+	}
+	actGarm, ok := act["garm"].(map[string]any)
+	if !ok {
+		t.Fatal("act carries no garm claim; garmd's ParseClaims refuses the whole token")
+	}
+	if !sliceEqual(strSlice(actGarm, "tool_sets"), []string{"support"}) {
+		t.Errorf("act.garm.tool_sets = %v, want [support] — the agent's own declared scope, unchanged by this fix", strSlice(actGarm, "tool_sets"))
+	}
+}

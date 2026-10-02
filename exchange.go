@@ -215,11 +215,21 @@ type garmClaimJSON struct {
 	Kind         string   `json:"kind"`
 }
 
-// actClaimJSON is one `act` level. The OUTER one is never a pointer field on
-// mintedToken below: Go always marshals a struct value, which makes it
-// impossible for this package to silently omit the first `act` level by
-// leaving a pointer nil. A nested Act is a pointer because it is genuinely
-// optional: it is present only on the employee-for-customer-to-an-agent
+// actClaimJSON is one `act` level.
+//
+// The OUTER one, on mintedToken below, is a pointer with omitempty — but
+// that is narrower than "optional": every caller except ONE still builds it
+// unconditionally, the same way earlier revisions of this type made that
+// structurally impossible to skip. The one exception is a SERVICE minting
+// for itself (decisions/2026-10-02-the-agent-is-authorization-input-not-an-
+// actor.md): the agent it names is what CanRun is asked about, never a
+// party acting for it, so there is nothing to put at `act` — omitting the
+// key is the honest statement of that, not a shortcut that happened to be
+// available. Every other mint (exchange 1, and exchange 2 for a real
+// subject) still names a party at `act` and still builds this unconditionally.
+//
+// A nested Act is a pointer because it is genuinely optional in the
+// ordinary sense: present only on the employee-for-customer-to-an-agent
 // path, where the chain is customer (sub) -> agent (act) -> employee
 // (act.act) — RFC 8693 §4.1: the outermost act is the CURRENT actor, a
 // nested act is a PRIOR one, so the agent (who acts now) sits outside the
@@ -258,7 +268,12 @@ type mintedToken struct {
 	ID        string        `json:"jti"`
 	Tenant    string        `json:"tenant"`
 	Garm      garmClaimJSON `json:"garm"`
-	Act       actClaimJSON  `json:"act"`
+
+	// Act is a pointer with omitempty: nil ONLY for a SERVICE minting for
+	// itself, where the agent it named is authorization input to CanRun and
+	// never an actor — see actClaimJSON's doc. Every other mint still builds
+	// one unconditionally.
+	Act *actClaimJSON `json:"act,omitempty"`
 
 	// Exec is a POINTER with omitempty so exchange 1 emits no `exec` key at
 	// all — not a null, not an empty object. "Was this token obtained by a
@@ -857,6 +872,24 @@ func (s *Server) exchange(ctx context.Context, req exchangeRequest) (string, tim
 func (s *Server) resolveAndMint(ctx context.Context, in mintInputs) (string, time.Duration, error) {
 	mintingForAgent := in.agent != ""
 
+	// selfMint is a SERVICE minting for itself (decisions/2026-10-02-the-
+	// agent-is-authorization-input-not-an-actor.md). in.service is set by
+	// exchange2's SERVICE branch alone, and only after on_behalf_of has
+	// already been checked to equal "service:"+the authenticated client —
+	// so this is never "some other service", it is always the caller minting
+	// as itself.
+	//
+	// The agent such a mint names was already asked of CanRun, OUTSIDE this
+	// function, before resolveAndMint was ever called — that is what decides
+	// whether this runner may execute that agent at all. What changes HERE is
+	// that the answer to CanRun is not also spent on putting the agent at
+	// `act`: a service that may run an agent is not thereby an agent acting
+	// for anyone, and folding the agent's own declared claim into this
+	// token's chain would narrow the service's authority by a claim that was
+	// never an actor's to assert. See actClaimJSON's doc for the shape this
+	// produces.
+	selfMint := in.service != ""
+
 	// Step 6: who the sub is allowed to be.
 	//
 	// Two resolutions, and which one runs is the difference between the two
@@ -912,8 +945,15 @@ func (s *Server) resolveAndMint(ctx context.Context, in mintInputs) (string, tim
 	// Step 7: claims, for whoever is named at `act`. An agent's authority is
 	// its own declared claim, never narrowed here — narrowing (intersecting
 	// against sub) happens in garmd, not this service (spec §2.3).
+	//
+	// NOT resolved at all for a self-mint: there is nobody at `act` to carry
+	// a claim for. in.agent was already spent on CanRun, above; resolving
+	// policy.ForAgent here would only produce a GarmClaim whose sole purpose
+	// was to be folded into a chain this mint no longer builds.
 	var actClaim *GarmClaim
-	if mintingForAgent {
+	if selfMint {
+		// left nil and unused below.
+	} else if mintingForAgent {
 		actClaim, err = s.policy.ForAgent(in.agent)
 		if err != nil {
 			s.deny(ctx, "agent resolves to no roles", "agent", in.agent, "err", err)
@@ -952,12 +992,18 @@ func (s *Server) resolveAndMint(ctx context.Context, in mintInputs) (string, tim
 		}
 	}
 
-	// chain is every level this exchange is about to mint — 2 levels
-	// ordinarily, 3 when delegating to a named agent (sub, agent, employee).
-	// The runner is NOT in it: exec is provenance and is never folded.
-	chain := []*GarmClaim{subClaim, actClaim}
-	if mintingForAgent && in.delegating {
-		chain = append(chain, employeeClaim)
+	// chain is every level this exchange is about to mint — 1 level for a
+	// self-mint (sub alone: there is no actor), 2 ordinarily, 3 when
+	// delegating to a named agent (sub, agent, employee). The runner is NOT
+	// in it: exec is provenance and is never folded.
+	var chain []*GarmClaim
+	if selfMint {
+		chain = []*GarmClaim{subClaim}
+	} else {
+		chain = []*GarmClaim{subClaim, actClaim}
+		if mintingForAgent && in.delegating {
+			chain = append(chain, employeeClaim)
+		}
 	}
 
 	if len(intersectAllVerbs(chain)) == 0 {
@@ -986,22 +1032,28 @@ func (s *Server) resolveAndMint(ctx context.Context, in mintInputs) (string, tim
 	now := time.Now().UTC()
 	exp := now.Add(s.ttl)
 
-	actSubject := "agent:" + in.agent
-	if !mintingForAgent {
-		actSubject = in.employeeIdentity
-	}
+	// act stays nil for a self-mint — the one case this type's `act` key is
+	// omitted entirely, because there is no actor to name. Every other mint
+	// still builds one.
+	var act *actClaimJSON
+	if !selfMint {
+		actSubject := "agent:" + in.agent
+		if !mintingForAgent {
+			actSubject = in.employeeIdentity
+		}
 
-	act := actClaimJSON{
-		Subject: actSubject,
-		Garm:    toGarmClaimJSON(actClaim),
-	}
-	if mintingForAgent && in.delegating {
-		// customer (sub) -> agent (act) -> employee (act.act): the agent is
-		// the current actor and sits outermost; the employee, who acted
-		// earlier to obtain this token, nests inside it (RFC 8693 §4.1).
-		act.Act = &actClaimJSON{
-			Subject: in.employeeIdentity,
-			Garm:    toGarmClaimJSON(employeeClaim),
+		act = &actClaimJSON{
+			Subject: actSubject,
+			Garm:    toGarmClaimJSON(actClaim),
+		}
+		if mintingForAgent && in.delegating {
+			// customer (sub) -> agent (act) -> employee (act.act): the agent is
+			// the current actor and sits outermost; the employee, who acted
+			// earlier to obtain this token, nests inside it (RFC 8693 §4.1).
+			act.Act = &actClaimJSON{
+				Subject: in.employeeIdentity,
+				Garm:    toGarmClaimJSON(employeeClaim),
+			}
 		}
 	}
 
